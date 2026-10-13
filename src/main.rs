@@ -34,6 +34,7 @@ const CSS: &str = r#"
 .status-modified { color: @accent_color; background: alpha(@accent_color, 0.15); }
 .status-renamed { color: @warning_color; background: alpha(@warning_color, 0.15); }
 .status-conflict { color: @error_color; background: alpha(@warning_color, 0.25); }
+.navigation-sidebar .unchanged { opacity: 0.5; }
 .stat-add { color: @success_color; font-family: monospace; }
 .stat-del { color: @error_color; font-family: monospace; }
 .placeholder { padding: 14px; }

@@ -33,6 +33,9 @@ pub struct Window {
     tree_model: gtk::TreeListModel,
     selection: gtk::SingleSelection,
     tree_view: gtk::ListView,
+    /// Paths and statuses of the changed files, in file order, and the unchanged files.
+    tree_paths: RefCell<(Vec<(String, char)>, Vec<String>)>,
+    show_unchanged: Cell<bool>,
     /// The old (left) and new (right) column.
     scrollers: [gtk::ScrolledWindow; 2],
     contents: [gtk::Box; 2],
@@ -105,6 +108,7 @@ impl Window {
         let menu = gio::Menu::new();
         menu.append(Some("Show All Files in Full"), Some("win.expand-all"));
         menu.append(Some("Show Only Changes"), Some("win.collapse-all"));
+        menu.append(Some("Show Unchanged Files"), Some("win.show-unchanged"));
         menu.append(Some("Reload"), Some("win.reload"));
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -158,7 +162,7 @@ impl Window {
 
         // Sidebar
         let tree_store = gio::ListStore::new::<glib::BoxedAnyObject>();
-        let tree_model = gtk::TreeListModel::new(tree_store.clone(), false, true, |item| {
+        let tree_model = gtk::TreeListModel::new(tree_store.clone(), false, false, |item| {
             let node = item
                 .downcast_ref::<glib::BoxedAnyObject>()?
                 .borrow::<Rc<Node>>()
@@ -280,6 +284,8 @@ impl Window {
             tree_model,
             selection,
             tree_view,
+            tree_paths: RefCell::default(),
+            show_unchanged: Cell::new(false),
             scrollers,
             contents,
             linkmap,
@@ -346,10 +352,10 @@ impl Window {
                 let Some(node) = node_of(row.upcast_ref()) else {
                     return;
                 };
-                match (node.file, n_press) {
-                    (Some(i), 1) => this.scroll_to_file(i),
-                    (Some(i), _) => this.open_file(i),
-                    (None, 1) => row.set_expanded(!row.is_expanded()),
+                match (node.dir, node.file, n_press) {
+                    (true, _, 1) => row.set_expanded(!row.is_expanded()),
+                    (false, Some(i), 1) => this.scroll_to_file(i),
+                    (false, Some(i), _) => this.open_file(i),
                     _ => {}
                 }
             });
@@ -369,14 +375,17 @@ impl Window {
             let status = label.next_sibling().and_downcast::<gtk::Label>().unwrap();
             label.set_label(&node.name);
             label.set_tooltip_text(Some(&node.name));
-            if node.file.is_some() {
+            // Unchanged files (and directories without changes) are dimmed and inert.
+            hbox.set_css_classes(if node.changed { &[] } else { &["unchanged"] });
+            hbox.set_cursor_from_name((node.dir || node.changed).then_some("pointer"));
+            if node.dir {
+                icon.set_icon_name(Some("folder-symbolic"));
+                status.set_visible(false);
+            } else {
                 icon.set_icon_name(Some("text-x-generic-symbolic"));
                 status.set_label(&node.status.to_string());
                 status.set_css_classes(&["status", file_view::status_class(node.status)]);
-                status.set_visible(true);
-            } else {
-                icon.set_icon_name(Some("folder-symbolic"));
-                status.set_visible(false);
+                status.set_visible(node.changed);
             }
         });
     }
@@ -450,12 +459,12 @@ impl Window {
             let Some(row) = this.tree_model.item(pos) else {
                 return;
             };
-            match node_of(&row).and_then(|n| n.file) {
-                Some(i) => this.open_file(i),
-                None => {
-                    let row = row.downcast::<gtk::TreeListRow>().unwrap();
-                    row.set_expanded(!row.is_expanded());
-                }
+            let Some(node) = node_of(&row) else { return };
+            if node.dir {
+                let row = row.downcast::<gtk::TreeListRow>().unwrap();
+                row.set_expanded(!row.is_expanded());
+            } else if let Some(i) = node.file {
+                this.open_file(i);
             }
         });
 
@@ -629,6 +638,18 @@ impl Window {
         add("reload", |this| this.load());
         add("expand-all", |this| this.set_all_collapsed(false));
         add("collapse-all", |this| this.set_all_collapsed(true));
+
+        let action = gio::SimpleAction::new_stateful("show-unchanged", None, &false.to_variant());
+        let weak = Rc::downgrade(self);
+        action.connect_change_state(move |action, state| {
+            let (Some(this), Some(state)) = (weak.upgrade(), state) else {
+                return;
+            };
+            action.set_state(state);
+            this.show_unchanged.set(state.get().unwrap_or(false));
+            this.fill_tree();
+        });
+        self.window.add_action(&action);
     }
 
     pub fn load(self: &Rc<Self>) {
@@ -707,16 +728,15 @@ impl Window {
                 .iter()
                 .map(|f| (f.path.as_str(), f.status))
                 .collect();
-            tree::file_order(&tree::build(&paths))
+            tree::file_order(&tree::build(&paths, &[]))
         };
         let mut slots: Vec<_> = changes.drain(..).map(Some).collect();
         let changes: Vec<git::FileChange> =
             order.iter().map(|&i| slots[i].take().unwrap()).collect();
-        let paths: Vec<_> = changes
-            .iter()
-            .map(|f| (f.path.as_str(), f.status))
-            .collect();
-        let nodes = tree::build(&paths);
+        *self.tree_paths.borrow_mut() = (
+            changes.iter().map(|f| (f.path.clone(), f.status)).collect(),
+            cmp.unchanged,
+        );
 
         let mut files = Vec::with_capacity(changes.len());
         // Build the first screenful right away; the rest is built as it scrolls into view.
@@ -753,9 +773,7 @@ impl Window {
         }
         *self.files.borrow_mut() = files;
         self.update_filemaps();
-        for node in nodes {
-            self.tree_store.append(&glib::BoxedAnyObject::new(node));
-        }
+        self.fill_tree();
         self.stack.set_visible_child_name("diff");
 
         let this = self.clone();
@@ -766,6 +784,32 @@ impl Window {
             this.build_visible();
             this.sync_sidebar();
         });
+    }
+
+    /// (Re)builds the sidebar tree, with the unchanged files if they're shown. Directories
+    /// with changes start out expanded, the others collapsed.
+    fn fill_tree(&self) {
+        let paths = self.tree_paths.borrow();
+        let changed: Vec<_> = paths.0.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let unchanged: Vec<_> = if self.show_unchanged.get() {
+            paths.1.iter().map(String::as_str).collect()
+        } else {
+            Vec::new()
+        };
+        self.tree_store.remove_all();
+        for node in tree::build(&changed, &unchanged) {
+            self.tree_store.append(&glib::BoxedAnyObject::new(node));
+        }
+        // Expanding a row inserts its children right after it, so they're visited too.
+        let mut pos = 0;
+        while let Some(row) = self.tree_model.item(pos) {
+            if node_of(&row).is_some_and(|n| n.dir && n.changed) {
+                row.downcast::<gtk::TreeListRow>().unwrap().set_expanded(true);
+            }
+            pos += 1;
+        }
+        self.synced_file.set(None);
+        self.sync_sidebar();
     }
 
     fn set_all_collapsed(&self, collapsed: bool) {

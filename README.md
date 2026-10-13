@@ -9,6 +9,7 @@ scrolling sequence instead of one tab per file.
 - Only changed regions are shown (3 lines of context); click a file header to see the full file
 - Syntax highlighting and real line numbers (GtkSourceView)
 - File tree sidebar: click to jump to a file, double-click to show it in full
+  (menu → Show Unchanged Files adds the rest of the repository, dimmed)
 - Ctrl+F search across the whole diff
 
 ## Usage

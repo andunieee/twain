@@ -5,8 +5,11 @@ use std::rc::Rc;
 
 pub struct Node {
     pub name: String,
-    /// Index into the file list for files, `None` for directories.
+    pub dir: bool,
+    /// Index into the file list for changed files, `None` for unchanged files and directories.
     pub file: Option<usize>,
+    /// Whether this is a changed file or a directory containing one.
+    pub changed: bool,
     pub status: char,
     pub children: Vec<Rc<Node>>,
 }
@@ -14,20 +17,26 @@ pub struct Node {
 #[derive(Default)]
 struct Dir<'a> {
     dirs: BTreeMap<&'a str, Dir<'a>>,
-    files: Vec<(&'a str, usize, char)>,
+    files: Vec<(&'a str, Option<usize>, char)>,
+    changed: bool,
 }
 
-/// Builds a tree from `(path, status)` pairs. Directories come before files and chains of
-/// single-child directories are merged ("src/ui" instead of "src" → "ui").
-pub fn build(paths: &[(&str, char)]) -> Vec<Rc<Node>> {
+/// Builds a tree from `(path, status)` pairs of changed files plus the paths of `unchanged`
+/// ones. Directories come before files and chains of single-child directories are merged
+/// ("src/ui" instead of "src" → "ui").
+pub fn build(paths: &[(&str, char)], unchanged: &[&str]) -> Vec<Rc<Node>> {
     let mut root = Dir::default();
-    for (i, &(path, status)) in paths.iter().enumerate() {
+    let changed = paths.iter().enumerate().map(|(i, &(p, s))| (p, Some(i), s));
+    let unchanged = unchanged.iter().map(|&p| (p, None, ' '));
+    for (path, file, status) in changed.chain(unchanged) {
         let mut parts: Vec<&str> = path.split('/').collect();
         let name = parts.pop().unwrap();
-        let dir = parts
-            .into_iter()
-            .fold(&mut root, |d, p| d.dirs.entry(p).or_default());
-        dir.files.push((name, i, status));
+        let dir = parts.into_iter().fold(&mut root, |d, p| {
+            let sub = d.dirs.entry(p).or_default();
+            sub.changed |= file.is_some();
+            sub
+        });
+        dir.files.push((name, file, status));
     }
     convert(root)
 }
@@ -43,17 +52,21 @@ fn convert(dir: Dir) -> Vec<Rc<Node>> {
         }
         out.push(Rc::new(Node {
             name,
+            dir: true,
             file: None,
+            changed: sub.changed,
             status: ' ',
             children: convert(sub),
         }));
     }
     let mut files = dir.files;
     files.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, i, status) in files {
+    for (name, file, status) in files {
         out.push(Rc::new(Node {
             name: name.into(),
-            file: Some(i),
+            dir: false,
+            file,
+            changed: file.is_some(),
             status,
             children: Vec::new(),
         }));
@@ -61,7 +74,7 @@ fn convert(dir: Dir) -> Vec<Rc<Node>> {
     out
 }
 
-/// File indices in depth-first (display) order.
+/// Changed file indices in depth-first (display) order.
 pub fn file_order(nodes: &[Rc<Node>]) -> Vec<usize> {
     let mut out = Vec::new();
     for n in nodes {

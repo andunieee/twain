@@ -90,6 +90,8 @@ pub struct Comparison {
     /// Human readable description, e.g. "HEAD → working tree".
     pub description: String,
     pub files: Vec<FileChange>,
+    /// Every other file on the new side, for showing the whole tree.
+    pub unchanged: Vec<String>,
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -250,6 +252,19 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         }
     }
 
+    let listing = match &new_side {
+        NewSide::WorkTree | NewSide::Index => git(&root, &["ls-files", "-z"])?,
+        NewSide::Rev(r) => git(&root, &["ls-tree", "-r", "-z", "--name-only", r])?,
+    };
+    let changed: std::collections::HashSet<&str> =
+        entries.iter().map(|(_, _, path)| path.as_str()).collect();
+    let unchanged: Vec<String> = listing
+        .split(|&b| b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .filter(|f| !changed.contains(f.as_str()))
+        .collect();
+
     let files = entries
         .into_iter()
         .map(|(status, old_path, path)| {
@@ -282,6 +297,7 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         description: format!("{} → {new_label}", short(&old_label)),
         root,
         files,
+        unchanged,
     })
 }
 
