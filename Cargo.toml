@@ -1,0 +1,11 @@
+[package]
+name = "twain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+pangocairo = "0.22"
+similar = "2.7"
+sourceview5 = "0.11"
