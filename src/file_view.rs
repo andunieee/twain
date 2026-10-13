@@ -220,7 +220,10 @@ impl Half {
         toggle_label.add_css_class("dim-label");
         toggle_label.add_css_class("caption");
         header_box.append(&toggle_label);
-        let header = gtk::Button::builder().child(&header_box).build();
+        let header = gtk::Button::builder()
+            .child(&header_box)
+            .cursor(&gdk::Cursor::from_name("pointer", None).unwrap())
+            .build();
         header.add_css_class("file-header");
         widget.append(&header);
 

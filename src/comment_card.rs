@@ -27,6 +27,7 @@ fn icon_button(icon: &str, tooltip: &str, on_click: impl Fn() + 'static) -> gtk:
         .icon_name(icon)
         .tooltip_text(tooltip)
         .valign(gtk::Align::Center)
+        .cursor(&gdk::Cursor::from_name("pointer", None).unwrap())
         .build();
     b.add_css_class("flat");
     b.add_css_class("circular");
@@ -135,9 +136,11 @@ impl Card {
             let cancel = gtk::Button::with_label("Cancel");
             let a = act.clone();
             cancel.connect_clicked(move |_| a(Action::Cancel));
+            cancel.set_cursor_from_name(Some("pointer"));
             buttons.append(&cancel);
             let save = gtk::Button::with_label(if is_new { "Comment" } else { "Save" });
             save.add_css_class("suggested-action");
+            save.set_cursor_from_name(Some("pointer"));
             let (a, v) = (act.clone(), view.downgrade());
             save.connect_clicked(move |_| {
                 if let Some(v) = v.upgrade() {

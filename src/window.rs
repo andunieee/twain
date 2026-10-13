@@ -11,7 +11,7 @@ use crate::file_view::{self, FileView, Shared};
 use crate::git::{self, Options};
 use crate::tree::{self, Node};
 use adw::prelude::*;
-use gtk::{gio, glib, graphene};
+use gtk::{gdk, gio, glib, graphene};
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -91,12 +91,14 @@ fn node_of(row: &glib::Object) -> Option<Rc<Node>> {
 impl Window {
     pub fn new(app: &adw::Application, opts: Options) -> Rc<Window> {
         let title = adw::WindowTitle::new("Twain", "");
+        let pointer = gdk::Cursor::from_name("pointer", None).unwrap();
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&title));
 
         let search_button = gtk::ToggleButton::builder()
             .icon_name("system-search-symbolic")
             .tooltip_text("Search (Ctrl+F)")
+            .cursor(&pointer)
             .build();
         header.pack_end(&search_button);
 
@@ -107,6 +109,7 @@ impl Window {
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .menu_model(&menu)
+            .cursor(&pointer)
             .build();
         header.pack_end(&menu_button);
 
@@ -114,6 +117,7 @@ impl Window {
             .icon_name("view-refresh-symbolic")
             .tooltip_text("Reload (F5)")
             .action_name("win.reload")
+            .cursor(&pointer)
             .build();
         header.pack_start(&reload_button);
 
@@ -129,11 +133,13 @@ impl Window {
             .icon_name("go-up-symbolic")
             .tooltip_text("Previous match (Shift+Enter)")
             .action_name("win.find-prev")
+            .cursor(&pointer)
             .build();
         let next = gtk::Button::builder()
             .icon_name("go-down-symbolic")
             .tooltip_text("Next match (Enter)")
             .action_name("win.find-next")
+            .cursor(&pointer)
             .build();
         let search_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         search_box.append(&search_entry);
@@ -210,6 +216,7 @@ impl Window {
             let map = gtk::DrawingArea::builder()
                 .content_width(FILEMAP_WIDTH)
                 .visible(false)
+                .cursor(&pointer)
                 .build();
             map.add_css_class("filemap");
             map
@@ -313,6 +320,7 @@ impl Window {
         factory.connect_setup(move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            hbox.set_cursor_from_name(Some("pointer"));
             hbox.append(&gtk::Image::new());
             hbox.append(
                 &gtk::Label::builder()
@@ -491,7 +499,7 @@ impl Window {
             };
             let adj = this.scrollers[this.master.get()].vadjustment();
             let step = match ctl.unit() {
-                gtk::gdk::ScrollUnit::Wheel => adj.page_size().powf(2.0 / 3.0),
+                gdk::ScrollUnit::Wheel => adj.page_size().powf(2.0 / 3.0),
                 _ => 1.0,
             };
             adj.set_value(adj.value() + dy * step);
