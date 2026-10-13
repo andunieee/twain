@@ -38,6 +38,7 @@ const CSS: &str = r#"
 .stat-del { color: @error_color; font-family: monospace; }
 .placeholder { padding: 14px; }
 .linkmap { background: alpha(currentColor, 0.03); }
+.filemap { background: alpha(currentColor, 0.05); }
 .comment-card {
     padding: 8px 10px;
     border-radius: 8px;

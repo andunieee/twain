@@ -37,6 +37,8 @@ pub struct Window {
     scrollers: [gtk::ScrolledWindow; 2],
     contents: [gtk::Box; 2],
     linkmap: gtk::DrawingArea,
+    /// Overview of each column's changes, beside its scrollbar.
+    filemaps: [gtk::DrawingArea; 2],
     /// The column last scrolled by the user, which the other follows.
     master: Cell<usize>,
     /// Set while one column scrolls the other.
@@ -59,6 +61,7 @@ pub struct Window {
 }
 
 const LINKMAP_WIDTH: i32 = 44;
+const FILEMAP_WIDTH: i32 = 14;
 
 /// Where in the view the columns are synced, as a fraction of its height: the middle, but
 /// moving to the top in the first half screen and to the bottom in the last one, so both
@@ -203,10 +206,20 @@ impl Window {
             .content_width(LINKMAP_WIDTH)
             .build();
         linkmap.add_css_class("linkmap");
+        let filemaps = [(); 2].map(|_| {
+            let map = gtk::DrawingArea::builder()
+                .content_width(FILEMAP_WIDTH)
+                .visible(false)
+                .build();
+            map.add_css_class("filemap");
+            map
+        });
         let columns = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        columns.append(&filemaps[0]);
         columns.append(&scrollers[0]);
         columns.append(&linkmap);
         columns.append(&scrollers[1]);
+        columns.append(&filemaps[1]);
 
         let paned = gtk::Paned::builder()
             .start_child(&sidebar)
@@ -263,6 +276,7 @@ impl Window {
             scrollers,
             contents,
             linkmap,
+            filemaps,
             master: Cell::new(0),
             scroll_lock: Cell::new(false),
             sync_queued: Cell::new(false),
@@ -447,6 +461,7 @@ impl Window {
                     this.sync_scroll();
                 }
                 this.linkmap.queue_draw();
+                this.filemaps[side].queue_draw();
                 this.build_visible();
                 this.sync_sidebar();
             });
@@ -456,6 +471,7 @@ impl Window {
             adj.connect_changed(move |_| {
                 if let Some(this) = weak.upgrade() {
                     this.queue_sync();
+                    this.filemaps[side].queue_draw();
                     this.build_visible();
                 }
             });
@@ -482,6 +498,33 @@ impl Window {
             glib::Propagation::Stop
         });
         self.linkmap.add_controller(scroll);
+
+        for (side, map) in self.filemaps.iter().enumerate() {
+            let weak = Rc::downgrade(self);
+            map.set_draw_func(move |_, cr, w, h| {
+                if let Some(this) = weak.upgrade() {
+                    this.draw_filemap(side, cr, w, h);
+                }
+            });
+            // Clicking or dragging on the map centers the view there.
+            let drag = gtk::GestureDrag::new();
+            let start = Rc::new(Cell::new(0.0));
+            let weak = Rc::downgrade(self);
+            let start_y = start.clone();
+            drag.connect_drag_begin(move |_, _, y| {
+                start_y.set(y);
+                if let Some(this) = weak.upgrade() {
+                    this.scroll_to_filemap(side, y);
+                }
+            });
+            let weak = Rc::downgrade(self);
+            drag.connect_drag_update(move |_, _, dy| {
+                if let Some(this) = weak.upgrade() {
+                    this.scroll_to_filemap(side, start.get() + dy);
+                }
+            });
+            map.add_controller(drag);
+        }
 
         let weak = Rc::downgrade(self);
         *self.shared.on_line_height.borrow_mut() = Some(Box::new(move || {
@@ -681,6 +724,7 @@ impl Window {
             fv.connect_toggle(move || {
                 if let Some(this) = weak.upgrade() {
                     this.refresh_search(false);
+                    this.update_filemaps();
                 }
             });
             for (side, content) in self.contents.iter().enumerate() {
@@ -700,6 +744,7 @@ impl Window {
             f.set_comments(by_path.remove(&f.change.path).unwrap_or_default());
         }
         *self.files.borrow_mut() = files;
+        self.update_filemaps();
         for node in nodes {
             self.tree_store.append(&glib::BoxedAnyObject::new(node));
         }
@@ -808,6 +853,9 @@ impl Window {
     /// Syncs the columns once the current allocation is done.
     fn queue_sync(self: &Rc<Self>) {
         self.linkmap.queue_draw();
+        for map in &self.filemaps {
+            map.queue_draw();
+        }
         if self.sync_queued.replace(true) {
             return;
         }
@@ -850,6 +898,62 @@ impl Window {
             }
             f.draw_links(cr, w, h, tops);
         }
+    }
+
+    /// Shows the file maps while any file is shown in full; with only changes shown,
+    /// the whole column is changes and the map would say nothing.
+    fn update_filemaps(&self) {
+        let any_full = self.files.borrow().iter().any(|f| !f.is_collapsed());
+        for map in &self.filemaps {
+            map.set_visible(any_full);
+            map.queue_draw();
+        }
+    }
+
+    /// Draws one column's file map: its whole content scaled to the map's height, with a
+    /// mark for each change and a box around what's in view.
+    fn draw_filemap(&self, side: usize, cr: &gtk::cairo::Context, width: i32, height: i32) {
+        let adj = self.scrollers[side].vadjustment();
+        let total = adj.upper() - adj.lower();
+        if total <= 0.0 {
+            return;
+        }
+        let (w, scale) = (width as f64, height as f64 / total);
+        for f in self.files.borrow().iter() {
+            let Some(body) = f.body_y(side, &self.contents[side]) else {
+                continue;
+            };
+            for chunk in &f.layout.borrow().chunks {
+                let (top, bottom) = if side == 0 { chunk.left } else { chunk.right };
+                let y0 = ((body + top as f64) * scale).floor();
+                let y1 = ((body + bottom as f64) * scale).ceil().max(y0 + 2.0);
+                let (r, g, b) = file_view::kind_color(chunk.kind);
+                cr.set_source_rgba(r, g, b, 0.9);
+                cr.rectangle(2.0, y0, w - 4.0, y1 - y0);
+                let _ = cr.fill();
+            }
+        }
+        let fg = self.filemaps[side].color();
+        let (r, g, b) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
+        let y0 = ((adj.value() - adj.lower()) * scale).floor() + 0.5;
+        let h = (adj.page_size() * scale).max(4.0).floor() - 1.0;
+        cr.rectangle(0.5, y0, w - 1.0, h);
+        cr.set_source_rgba(r, g, b, 0.12);
+        let _ = cr.fill_preserve();
+        cr.set_source_rgba(r, g, b, 0.5);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    }
+
+    /// Scrolls a column so the point at `y` in its file map is in the middle of the view.
+    fn scroll_to_filemap(&self, side: usize, y: f64) {
+        let adj = self.scrollers[side].vadjustment();
+        let height = self.filemaps[side].height() as f64;
+        if height <= 0.0 {
+            return;
+        }
+        let content = adj.lower() + y / height * (adj.upper() - adj.lower());
+        self.scroll_column(side, content - adj.page_size() / 2.0);
     }
 
     /// Builds the text views of files in or near the viewport of either column.
