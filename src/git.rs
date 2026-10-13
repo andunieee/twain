@@ -17,6 +17,7 @@ pub struct Options {
 
 pub const USAGE: &str = "\
 usage: twain [-C <dir>] [--staged] [<rev> [<rev>]]
+       twain comment <command> ...   (see twain comment --help)
 
   twain                 HEAD vs working tree (staged + unstaged + untracked)
   twain --staged        HEAD vs index
@@ -142,13 +143,21 @@ fn worktree_file(root: &Path, path: &str) -> Content {
     }
 }
 
-/// Resolves the options against the repository and loads every changed file.
-pub fn load(opts: &Options) -> Result<Comparison, String> {
-    let cwd = match &opts.dir {
-        Some(d) => d.clone(),
+/// The top level of the repository containing `dir` (default: the current directory).
+pub fn repo_root(dir: Option<&Path>) -> Result<PathBuf, String> {
+    let cwd = match dir {
+        Some(d) => d.to_path_buf(),
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
-    let root = PathBuf::from(git_str(&cwd, &["rev-parse", "--show-toplevel"])?);
+    Ok(PathBuf::from(git_str(
+        &cwd,
+        &["rev-parse", "--show-toplevel"],
+    )?))
+}
+
+/// Resolves the options against the repository and loads every changed file.
+pub fn load(opts: &Options) -> Result<Comparison, String> {
+    let root = repo_root(opts.dir.as_deref())?;
 
     let has_head = git(&root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
     let head = || {

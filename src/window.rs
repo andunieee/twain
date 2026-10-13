@@ -1,5 +1,6 @@
 //! Main window: file tree sidebar, the sequence of file diffs, and search.
 
+use crate::comments::{self, Listener};
 use crate::file_view::{self, FileView, Shared};
 use crate::git::{self, Options};
 use crate::tree::{self, Node};
@@ -40,6 +41,8 @@ pub struct Window {
     current: Cell<Option<usize>>,
     /// (file, side) whose buffer has the current-match tag applied.
     tagged: Cell<Option<(usize, usize)>>,
+    /// Receives the keys other processes write to the comment database.
+    listener: Option<Listener>,
 }
 
 fn style_scheme() -> Option<sourceview5::StyleScheme> {
@@ -189,7 +192,12 @@ impl Window {
             scheme: RefCell::new(style_scheme()),
             search_settings,
             on_line_height: RefCell::default(),
+            root: RefCell::default(),
+            author: glib::user_name().to_string_lossy().into_owned(),
         });
+        let listener = Listener::bind()
+            .inspect_err(|e| eprintln!("twain: won't see comments from other processes: {e}"))
+            .ok();
 
         let this = Rc::new(Window {
             window,
@@ -213,6 +221,7 @@ impl Window {
             matches: RefCell::default(),
             current: Cell::new(None),
             tagged: Cell::new(None),
+            listener,
         });
         // Widgets only hold weak references to this struct; keep it alive as long as the window.
         let keep_alive = RefCell::new(Some(this.clone()));
@@ -220,6 +229,7 @@ impl Window {
             .connect_destroy(move |_| drop(keep_alive.take()));
 
         this.setup_tree_factory(&factory);
+        this.setup_listener();
         this.setup_signals();
         this.setup_actions();
         this
@@ -292,6 +302,52 @@ impl Window {
                 status.set_visible(false);
             }
         });
+    }
+
+    /// Requeries the comments of files that other processes wrote to.
+    fn setup_listener(self: &Rc<Self>) {
+        let Some(listener) = &self.listener else {
+            return;
+        };
+        let socket = match listener
+            .dup_fd()
+            .map_err(|e| e.to_string())
+            .and_then(|fd| gio::Socket::from_fd(fd).map_err(|e| e.to_string()))
+        {
+            Ok(s) => s,
+            Err(e) => return eprintln!("twain: won't see comments from other processes: {e}"),
+        };
+        let weak = Rc::downgrade(self);
+        let source = gio::prelude::SocketExtManual::create_source(
+            &socket,
+            glib::IOCondition::IN,
+            None::<&gio::Cancellable>,
+            None,
+            glib::Priority::DEFAULT,
+            move |_, _| {
+                let Some(this) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let keys = this
+                    .listener
+                    .as_ref()
+                    .map(Listener::drain)
+                    .unwrap_or_default();
+                let root = this.shared.root.borrow().clone();
+                let paths: std::collections::HashSet<String> = keys
+                    .into_iter()
+                    .filter(|k| k.root == root)
+                    .map(|k| k.path)
+                    .collect();
+                for f in this.files.borrow().iter() {
+                    if paths.contains(&f.change.path) {
+                        f.reload_comments();
+                    }
+                }
+                glib::ControlFlow::Continue
+            },
+        );
+        source.attach(None);
     }
 
     fn setup_signals(self: &Rc<Self>) {
@@ -470,6 +526,7 @@ impl Window {
         self.title
             .set_title(repo_name.as_deref().unwrap_or("Twain"));
         self.title.set_subtitle(&cmp.description);
+        *self.shared.root.borrow_mut() = cmp.root.to_string_lossy().into_owned();
         self.window.set_title(Some(&format!(
             "{} — Twain",
             repo_name.as_deref().unwrap_or("")
@@ -534,6 +591,17 @@ impl Window {
             });
             self.content.append(&fv.widget);
             files.push(fv);
+        }
+        let mut by_path: std::collections::HashMap<String, Vec<comments::Comment>> =
+            std::collections::HashMap::new();
+        match comments::store().and_then(|s| s.list(&self.shared.root.borrow(), None)) {
+            Ok(list) => list
+                .into_iter()
+                .for_each(|c| by_path.entry(c.path.clone()).or_default().push(c)),
+            Err(e) => eprintln!("twain: {e}"),
+        }
+        for f in &files {
+            f.set_comments(by_path.remove(&f.change.path).unwrap_or_default());
         }
         *self.files.borrow_mut() = files;
         for node in nodes {

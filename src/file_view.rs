@@ -5,16 +5,22 @@
 //! padded so both sides stay aligned; the curved links between the sides are drawn in a
 //! narrow drawing area in the middle.
 
-use crate::diff::{self, Block, ChunkKind, Layout};
+use crate::comment_card::{Action, Card};
+use crate::comments::{self, Comment, Location, Side as CommentSide};
+use crate::diff::{self, Block, ChunkKind, Layout, Note};
 use crate::git::{Content, FileChange};
 use gtk::prelude::*;
-use gtk::{cairo, gdk, graphene};
+use gtk::{cairo, gdk, gio, glib, graphene};
 use sourceview5::prelude::*;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::{Rc, Weak};
 
 const GAP_HEIGHT: i32 = 24;
 const LINKMAP_WIDTH: i32 = 44;
+/// Space between a comment card and the text around it, and the side of its pane.
+const CARD_MARGIN: i32 = 6;
+const COMMENT_COLOR: (f64, f64, f64) = (0.96, 0.69, 0.13);
+const RESOLVED_COLOR: (f64, f64, f64) = (0.55, 0.55, 0.55);
 
 pub fn kind_color(kind: ChunkKind) -> (f64, f64, f64) {
     match kind {
@@ -154,6 +160,10 @@ pub struct Shared {
     pub search_settings: sourceview5::SearchSettings,
     /// Called when the first measured line height differs from what layouts were made with.
     pub on_line_height: RefCell<Option<Box<dyn Fn()>>>,
+    /// Repository root, as comments are keyed by it.
+    pub root: RefCell<String>,
+    /// Author of comments written in this window.
+    pub author: String,
 }
 
 pub struct FileView {
@@ -173,6 +183,11 @@ pub struct FileView {
     linkmap: gtk::DrawingArea,
     decorations: gtk::DrawingArea,
     toggle_label: gtk::Label,
+    comment_count: gtk::Label,
+    /// Comment cards (including one being written) and where their lines are.
+    cards: RefCell<Vec<(Card, Location)>>,
+    /// Width the cards were last measured for.
+    width: Cell<i32>,
     on_toggle: RefCell<Option<Box<dyn Fn()>>>,
     weak_self: Weak<FileView>,
 }
@@ -224,6 +239,10 @@ impl FileView {
             l.add_css_class("stat-del");
             header_box.append(&l);
         }
+        let comment_count = gtk::Label::new(None);
+        comment_count.add_css_class("comment-count");
+        comment_count.set_visible(false);
+        header_box.append(&comment_count);
         let toggle_label = gtk::Label::new(None);
         toggle_label.add_css_class("dim-label");
         toggle_label.add_css_class("caption");
@@ -268,8 +287,30 @@ impl FileView {
             linkmap: gtk::DrawingArea::new(),
             decorations: gtk::DrawingArea::new(),
             toggle_label,
+            comment_count,
+            cards: RefCell::default(),
+            width: Cell::new(0),
             on_toggle: RefCell::default(),
             weak_self: weak_self.clone(),
+        });
+        this.decorations.set_can_target(false);
+        this.body.add_overlay(&this.decorations);
+        let weak = Rc::downgrade(&this);
+        this.decorations.connect_resize(move |_, width, _| {
+            let Some(this) = weak.upgrade() else { return };
+            if this.width.replace(width) != width && !this.cards.borrow().is_empty() {
+                // Cards wrap differently now; not during allocation, though.
+                let weak = this.weak_self.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(this) = weak.upgrade() {
+                        this.relayout();
+                    }
+                });
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.body.connect_get_child_position(move |_, child| {
+            weak.upgrade().and_then(|this| this.card_rect(child))
         });
         if this.texts.is_some() {
             let weak = Rc::downgrade(&this);
@@ -339,11 +380,12 @@ impl FileView {
         hbox.append(&sides[0].scroller);
         hbox.append(&self.linkmap);
         hbox.append(&sides[1].scroller);
+        for (i, side) in sides.iter().enumerate() {
+            self.setup_comment_input(i, side);
+        }
         let _ = self.sides.set(sides);
         self.relayout();
         self.body.set_child(Some(&hbox));
-        self.decorations.set_can_target(false);
-        self.body.add_overlay(&self.decorations);
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -483,7 +525,12 @@ impl FileView {
             0 => ESTIMATED_LINE_HEIGHT,
             lh => lh,
         };
-        let layout = diff::layout(&self.blocks, self.collapsed.get(), lh, GAP_HEIGHT);
+        let notes = self.notes();
+        let layout = diff::layout(&self.blocks, &notes, self.collapsed.get(), lh, GAP_HEIGHT);
+        for ((card, _), y) in self.cards.borrow().iter().zip(&layout.notes) {
+            card.widget.set_visible(y.is_some());
+        }
+        self.body.queue_allocate();
         if let Some([old, new]) = self.sides() {
             old.apply_layout(&layout.sides[0]);
             new.apply_layout(&layout.sides[1]);
@@ -494,6 +541,297 @@ impl FileView {
             self.placeholder.set_height_request(layout.height);
         }
         *self.layout.borrow_mut() = layout;
+    }
+
+    fn root(&self) -> String {
+        self.shared.root.borrow().clone()
+    }
+
+    /// Re-reads this file's comments from the database.
+    pub fn reload_comments(&self) {
+        let root = self.root();
+        match comments::store().and_then(|s| s.list(&root, Some(&self.change.path))) {
+            Ok(list) => self.set_comments(list),
+            Err(e) => eprintln!("twain: {e}"),
+        }
+    }
+
+    /// Shows these comments, keeping any that are being edited as they are.
+    pub fn set_comments(&self, list: Vec<Comment>) {
+        let n = list.len();
+        self.comment_count
+            .set_label(&format!("{n} comment{}", if n == 1 { "" } else { "s" }));
+        self.comment_count.set_visible(n > 0);
+        let mut cards = self.cards.borrow_mut();
+        let mut kept = Vec::new();
+        for (card, loc) in cards.drain(..) {
+            if card.editor.is_some() {
+                kept.push((card, loc));
+            } else {
+                self.body.remove_overlay(&card.widget);
+            }
+        }
+        drop(cards);
+        if let Some(texts) = &self.texts {
+            for comment in list {
+                if kept.iter().any(|(c, _)| c.comment.id == comment.id) {
+                    continue;
+                }
+                let loc = comment.locate(&texts[comment.side.index()]);
+                let outdated = loc.outdated;
+                kept.push((self.make_card(comment, outdated, false), loc));
+            }
+        } else {
+            for (card, _) in &kept {
+                self.body.remove_overlay(&card.widget);
+            }
+            kept.clear();
+        }
+        kept.sort_by_key(|(c, loc)| {
+            (
+                c.comment.side,
+                loc.lines.start,
+                c.comment.id.is_empty(),
+                c.comment.created,
+            )
+        });
+        *self.cards.borrow_mut() = kept;
+        self.relayout();
+    }
+
+    fn make_card(&self, comment: Comment, outdated: bool, editing: bool) -> Card {
+        let (weak, id) = (self.weak_self.clone(), comment.id.clone());
+        let act = Rc::new(move |action| {
+            if let Some(this) = weak.upgrade() {
+                this.on_card_action(&id, action);
+            }
+        });
+        let card = Card::new(comment, outdated, editing, act);
+        self.body.add_overlay(&card.widget);
+        card
+    }
+
+    fn focus_editor(&self, id: &str) {
+        let editor = self
+            .cards
+            .borrow()
+            .iter()
+            .find(|(c, _)| c.comment.id == id)
+            .and_then(|(c, _)| c.editor.clone());
+        if let Some(editor) = editor {
+            // Once it has been allocated.
+            glib::idle_add_local_once(move || {
+                editor.grab_focus();
+            });
+        }
+    }
+
+    /// Replaces a card with a fresh one, as an editor or not; `None` removes it.
+    fn replace_card(&self, id: &str, editing: Option<bool>) {
+        let mut cards = self.cards.borrow_mut();
+        let Some(i) = cards.iter().position(|(c, _)| c.comment.id == id) else {
+            return;
+        };
+        let (old, loc) = cards.remove(i);
+        self.body.remove_overlay(&old.widget);
+        if let Some(editing) = editing {
+            let card = self.make_card(old.comment, loc.outdated, editing);
+            cards.insert(i, (card, loc));
+        }
+        drop(cards);
+        self.relayout();
+    }
+
+    fn on_card_action(&self, id: &str, action: Action) {
+        let comment = self
+            .cards
+            .borrow()
+            .iter()
+            .find(|(c, _)| c.comment.id == id)
+            .map(|(c, _)| c.comment.clone());
+        let Some(mut comment) = comment else { return };
+        if matches!(action, Action::Save(_) | Action::Cancel)
+            && let Some(sides) = self.sides()
+        {
+            // Rather than wherever focus would go once the editor is gone.
+            sides[comment.side.index()].view.grab_focus();
+        }
+        let root = self.root();
+        let result = match action {
+            Action::Resize => {
+                self.relayout();
+                return;
+            }
+            Action::Edit => {
+                self.replace_card(id, Some(true));
+                self.focus_editor(id);
+                return;
+            }
+            Action::Cancel => {
+                self.replace_card(id, if id.is_empty() { None } else { Some(false) });
+                return;
+            }
+            Action::Save(text) => {
+                if text.is_empty() {
+                    return;
+                }
+                comment.body = text;
+                comment.updated = comments::now();
+                // Stop editing, so that the reload below shows the saved version.
+                self.replace_card(id, None);
+                comments::store().and_then(|s| s.put(&root, &mut [comment]))
+            }
+            Action::Delete => comments::store().and_then(|s| s.delete(&root, &[comment])),
+            Action::ToggleResolved => {
+                comment.resolved = !comment.resolved;
+                comment.updated = comments::now();
+                comments::store().and_then(|s| s.put(&root, &mut [comment]))
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("twain: {e}");
+        }
+        self.reload_comments();
+    }
+
+    /// Opens an editor for a new comment on the selected lines (or the cursor's line).
+    fn comment_on_selection(&self, side: usize) {
+        let (Some(sides), Some(texts)) = (self.sides(), &self.texts) else {
+            return;
+        };
+        let buffer = &sides[side].buffer;
+        let (a, b) = buffer.selection_bounds().unwrap_or_else(|| {
+            let i = buffer.iter_at_mark(&buffer.get_insert());
+            (i, i)
+        });
+        let start = a.line() as usize;
+        let mut end = b.line() as usize;
+        if end > start && b.starts_line() {
+            end -= 1;
+        }
+        // Only one new comment at a time.
+        self.replace_card("", None);
+        let comment = Comment::new(
+            &self.change.path,
+            CommentSide::from_index(side),
+            start..end + 1,
+            "",
+            &self.shared.author,
+            &texts[side],
+        );
+        let loc = Location {
+            lines: start..end + 1,
+            outdated: false,
+        };
+        let card = self.make_card(comment, false, true);
+        self.cards.borrow_mut().push((card, loc));
+        self.relayout();
+        self.focus_editor("");
+    }
+
+    fn setup_comment_input(&self, i: usize, side: &Side) {
+        let group = gio::SimpleActionGroup::new();
+        let action = gio::SimpleAction::new("comment", None);
+        let weak = self.weak_self.clone();
+        action.connect_activate(move |_, _| {
+            if let Some(this) = weak.upgrade() {
+                this.comment_on_selection(i);
+            }
+        });
+        group.add_action(&action);
+        side.view.insert_action_group("side", Some(&group));
+        let menu = gio::Menu::new();
+        menu.append(Some("Add Comment (C)"), Some("side.comment"));
+        side.view.set_extra_menu(Some(&menu));
+
+        let keys = gtk::EventControllerKey::new();
+        let weak = self.weak_self.clone();
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let plain = !mods.intersects(
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SUPER_MASK,
+            );
+            if plain
+                && matches!(key, gdk::Key::c | gdk::Key::C)
+                && let Some(this) = weak.upgrade()
+            {
+                this.comment_on_selection(i);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        side.view.add_controller(keys);
+
+        // A right click outside the selection comments on the clicked line.
+        let click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .build();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let view = side.view.downgrade();
+        click.connect_pressed(move |_, _, x, y| {
+            let Some(view) = view.upgrade() else { return };
+            let (bx, by) =
+                view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let Some(iter) = view.iter_at_location(bx, by) else {
+                return;
+            };
+            let buffer = view.buffer();
+            let inside = buffer
+                .selection_bounds()
+                .is_some_and(|(a, b)| a.line() <= iter.line() && iter.line() <= b.line());
+            if !inside {
+                buffer.place_cursor(&iter);
+            }
+        });
+        side.view.add_controller(click);
+    }
+
+    fn side_width(&self) -> i32 {
+        if let Some(w) = self
+            .sides()
+            .map(|s| s[0].scroller.width())
+            .filter(|&w| w > 0)
+        {
+            return w;
+        }
+        match self.body.width() {
+            0 => 600,
+            w => ((w - LINKMAP_WIDTH) / 2).max(100),
+        }
+    }
+
+    /// Space each card needs, measured at the width of its pane.
+    fn notes(&self) -> Vec<Note> {
+        let width = self.side_width() - 2 * CARD_MARGIN;
+        self.cards
+            .borrow()
+            .iter()
+            .map(|(card, loc)| Note {
+                side: card.comment.side.index(),
+                lines: loc.lines.clone(),
+                height: card.height_for(width) + 2 * CARD_MARGIN,
+            })
+            .collect()
+    }
+
+    /// Where a card goes in the body overlay.
+    fn card_rect(&self, child: &gtk::Widget) -> Option<gdk::Rectangle> {
+        let cards = self.cards.borrow();
+        let layout = self.layout.borrow();
+        let i = cards
+            .iter()
+            .position(|(c, _)| c.widget.upcast_ref::<gtk::Widget>() == child)?;
+        let y = (*layout.notes.get(i)?)?;
+        let side = cards[i].0.comment.side.index();
+        let width = self.side_width();
+        let x = self
+            .sides()
+            .and_then(|s| s[side].scroller.compute_bounds(&self.body))
+            .map_or(side as i32 * (width + LINKMAP_WIDTH), |b| b.x() as i32);
+        let w = width - 2 * CARD_MARGIN;
+        let h = cards[i].0.height_for(w);
+        Some(gdk::Rectangle::new(x + CARD_MARGIN, y + CARD_MARGIN, w, h))
     }
 
     /// The meld-style curved bands connecting each chunk on the left to its counterpart.
@@ -535,6 +873,25 @@ impl FileView {
             cr.move_to(x0, y);
             cr.line_to(x1, y);
         };
+
+        let lh = layout.line_height() as f64;
+        for (card, loc) in self.cards.borrow().iter() {
+            let side = card.comment.side.index();
+            let (x0, x1) = [left, right][side];
+            let y0 = layout.line_y(side, loc.lines.start) as f64;
+            let y1 = layout.line_y(side, loc.lines.end - 1) as f64 + lh;
+            let (r, g, b) = if card.comment.resolved {
+                RESOLVED_COLOR
+            } else {
+                COMMENT_COLOR
+            };
+            cr.set_source_rgba(r, g, b, 0.10);
+            cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+            let _ = cr.fill();
+            cr.set_source_rgba(r, g, b, 0.9);
+            cr.rectangle(x0, y0, 3.0, y1 - y0);
+            let _ = cr.fill();
+        }
 
         cr.set_line_width(1.0);
         for chunk in &layout.chunks {

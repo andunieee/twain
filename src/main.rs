@@ -1,3 +1,6 @@
+mod cli;
+mod comment_card;
+mod comments;
 mod diff;
 mod file_view;
 mod git;
@@ -35,10 +38,32 @@ const CSS: &str = r#"
 .stat-del { color: @error_color; font-family: monospace; }
 .placeholder { padding: 14px; }
 .linkmap { background: alpha(currentColor, 0.03); }
+.comment-card {
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: @view_bg_color;
+    border: 1px solid alpha(#f5b021, 0.7);
+    box-shadow: 0 1px 4px alpha(black, 0.15);
+}
+.comment-card.resolved { border-color: alpha(currentColor, 0.2); }
+.comment-card.resolved .comment-body { opacity: 0.6; }
+.comment-card button.circular { min-width: 24px; min-height: 24px; padding: 0; }
+.comment-editor { border-radius: 6px; border: 1px solid alpha(currentColor, 0.2); min-height: 60px; }
+.comment-badge { font-size: smaller; font-weight: bold; border-radius: 4px; padding: 0 5px; }
+.comment-badge.warning { color: @warning_color; background: alpha(@warning_color, 0.15); }
+.comment-badge.success { color: @success_color; background: alpha(@success_color, 0.15); }
+.comment-count { color: #c88a0e; font-size: smaller; font-weight: bold; }
 "#;
 
 fn main() -> glib::ExitCode {
-    let opts = match git::Options::parse(std::env::args().skip(1)) {
+    let mut args = std::env::args().skip(1).peekable();
+    if args
+        .next_if(|a| a == "comment" || a == "comments")
+        .is_some()
+    {
+        return glib::ExitCode::from(cli::run(args) as u8);
+    }
+    let opts = match git::Options::parse(args) {
         Ok(opts) => opts,
         Err(err) => {
             if !err.is_empty() {
