@@ -1,9 +1,10 @@
-//! One file of the diff: a clickable header and a meld-style side-by-side body.
+//! One file of the diff, as two halves: the old side goes in the window's left column and
+//! the new side in the right one, each a clickable header and a body.
 //!
 //! Each side is a GtkSourceView holding the *whole* file, so syntax highlighting and line
-//! numbers are correct. Unchanged regions are hidden with an invisible tag, and lines are
-//! padded so both sides stay aligned; the curved links between the sides are drawn in a
-//! narrow drawing area in the middle.
+//! numbers are correct. Unchanged regions are hidden with an invisible tag. Like meld, the
+//! sides aren't padded to line up: each column scrolls on its own, kept in sync through the
+//! layout's anchors, and the curved links between them are drawn by the window.
 
 use crate::comment_card::{Action, Card};
 use crate::comments::{self, Comment, Location, Side as CommentSide};
@@ -16,7 +17,6 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::{Rc, Weak};
 
 const GAP_HEIGHT: i32 = 24;
-const LINKMAP_WIDTH: i32 = 44;
 /// Space between a comment card and the text around it, and the side of its pane.
 const CARD_MARGIN: i32 = 6;
 const COMMENT_COLOR: (f64, f64, f64) = (0.96, 0.69, 0.13);
@@ -37,6 +37,7 @@ fn rgba((r, g, b): (f64, f64, f64), a: f64) -> gdk::RGBA {
 pub struct Side {
     pub view: sourceview5::View,
     pub buffer: sourceview5::Buffer,
+    /// Scrolls horizontally; vertically, the whole column scrolls.
     pub scroller: gtk::ScrolledWindow,
     pub hidden: gtk::TextTag,
     /// Marks the current search match.
@@ -160,14 +161,106 @@ pub struct Shared {
     pub search_settings: sourceview5::SearchSettings,
     /// Called when the first measured line height differs from what layouts were made with.
     pub on_line_height: RefCell<Option<Box<dyn Fn()>>>,
+    /// Called after a file's layout changes.
+    pub on_relayout: RefCell<Option<Box<dyn Fn()>>>,
     /// Repository root, as comments are keyed by it.
     pub root: RefCell<String>,
     /// Author of comments written in this window.
     pub author: String,
 }
 
+/// What a file shows in one column: a header and the body below it.
+struct Half {
+    widget: gtk::Box,
+    body: gtk::Overlay,
+    placeholder: gtk::Box,
+    decorations: gtk::DrawingArea,
+    toggle_label: gtk::Label,
+    comment_count: gtk::Label,
+    /// Width the cards were last measured for.
+    width: Cell<i32>,
+}
+
+impl Half {
+    fn new(change: &FileChange, side: usize, stat: usize, message: Option<&str>) -> Half {
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.add_css_class("file-section");
+
+        let header_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let status = gtk::Label::new(Some(&change.status.to_string()));
+        status.add_css_class("status");
+        status.add_css_class(status_class(change.status));
+        header_box.append(&status);
+        let title = match (&change.old_path, side) {
+            (Some(old), 0) => old,
+            _ => &change.path,
+        };
+        let path = gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .build();
+        path.add_css_class("file-path");
+        header_box.append(&path);
+        if stat > 0 {
+            let (text, class) = match side {
+                0 => (format!("−{stat}"), "stat-del"),
+                _ => (format!("+{stat}"), "stat-add"),
+            };
+            let l = gtk::Label::new(Some(&text));
+            l.add_css_class(class);
+            header_box.append(&l);
+        }
+        let comment_count = gtk::Label::new(None);
+        comment_count.add_css_class("comment-count");
+        comment_count.set_visible(false);
+        header_box.append(&comment_count);
+        let toggle_label = gtk::Label::new(None);
+        toggle_label.add_css_class("dim-label");
+        toggle_label.add_css_class("caption");
+        header_box.append(&toggle_label);
+        let header = gtk::Button::builder().child(&header_box).build();
+        header.add_css_class("file-header");
+        widget.append(&header);
+
+        let body = gtk::Overlay::new();
+        let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        match message {
+            None => {
+                header.set_tooltip_text(Some("Toggle between changes only and the full file"));
+                body.set_child(Some(&placeholder));
+            }
+            Some(msg) => {
+                toggle_label.set_visible(false);
+                let l = gtk::Label::new(Some(msg));
+                l.add_css_class("dim-label");
+                l.add_css_class("placeholder");
+                body.set_child(Some(&l));
+            }
+        }
+        widget.append(&body);
+        let decorations = gtk::DrawingArea::new();
+        decorations.set_can_target(false);
+        body.add_overlay(&decorations);
+        Half {
+            widget,
+            body,
+            placeholder,
+            decorations,
+            toggle_label,
+            comment_count,
+            width: Cell::new(0),
+        }
+    }
+
+    fn header(&self) -> gtk::Button {
+        self.widget.first_child().and_downcast().unwrap()
+    }
+}
+
 pub struct FileView {
-    pub widget: gtk::Box,
+    halves: [Half; 2],
     pub change: FileChange,
     shared: Rc<Shared>,
     /// Sanitized old/new text; `None` for binary files and files without content changes.
@@ -178,16 +271,8 @@ pub struct FileView {
     blocks: Vec<Block>,
     collapsed: Cell<bool>,
     pub layout: RefCell<Layout>,
-    body: gtk::Overlay,
-    placeholder: gtk::Box,
-    linkmap: gtk::DrawingArea,
-    decorations: gtk::DrawingArea,
-    toggle_label: gtk::Label,
-    comment_count: gtk::Label,
     /// Comment cards (including one being written) and where their lines are.
     cards: RefCell<Vec<(Card, Location)>>,
-    /// Width the cards were last measured for.
-    width: Cell<i32>,
     on_toggle: RefCell<Option<Box<dyn Fn()>>>,
     weak_self: Weak<FileView>,
 }
@@ -204,76 +289,25 @@ impl FileView {
         };
         let has_changes = blocks.iter().any(|b| matches!(b, Block::Change(_)));
 
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.add_css_class("file-section");
-
-        // Header
         let (added, removed) = blocks.iter().fold((0, 0), |(a, r), b| match b {
             Block::Change(c) => (a + c.new.len(), r + c.old.len()),
             _ => (a, r),
         });
-        let header_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let status = gtk::Label::new(Some(&change.status.to_string()));
-        status.add_css_class("status");
-        status.add_css_class(status_class(change.status));
-        header_box.append(&status);
-        let title = match &change.old_path {
-            Some(old) => format!("{old} → {}", change.path),
-            None => change.path.clone(),
-        };
-        let path = gtk::Label::builder()
-            .label(&title)
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::Start)
-            .build();
-        path.add_css_class("file-path");
-        header_box.append(&path);
-        if added > 0 {
-            let l = gtk::Label::new(Some(&format!("+{added}")));
-            l.add_css_class("stat-add");
-            header_box.append(&l);
-        }
-        if removed > 0 {
-            let l = gtk::Label::new(Some(&format!("−{removed}")));
-            l.add_css_class("stat-del");
-            header_box.append(&l);
-        }
-        let comment_count = gtk::Label::new(None);
-        comment_count.add_css_class("comment-count");
-        comment_count.set_visible(false);
-        header_box.append(&comment_count);
-        let toggle_label = gtk::Label::new(None);
-        toggle_label.add_css_class("dim-label");
-        toggle_label.add_css_class("caption");
-        header_box.append(&toggle_label);
-        let header = gtk::Button::builder().child(&header_box).build();
-        header.add_css_class("file-header");
-        widget.append(&header);
-
         let texts = (is_text && has_changes).then_some([old_text, new_text]);
-        let body = gtk::Overlay::new();
-        let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        if texts.is_some() {
-            header.set_tooltip_text(Some("Toggle between changes only and the full file"));
-            body.set_child(Some(&placeholder));
-        } else {
-            toggle_label.set_visible(false);
-            let msg = match (&change.old, &change.new) {
-                (Content::Binary, _) | (_, Content::Binary) => "Binary file",
-                (Content::TooLarge, _) | (_, Content::TooLarge) => "File too large to display",
-                _ if change.old_path.is_some() => "Renamed without content changes",
-                _ => "No content changes",
-            };
-            let l = gtk::Label::new(Some(msg));
-            l.add_css_class("dim-label");
-            l.add_css_class("placeholder");
-            body.set_child(Some(&l));
-        }
-        widget.append(&body);
+        let message = match (&change.old, &change.new) {
+            _ if texts.is_some() => None,
+            (Content::Binary, _) | (_, Content::Binary) => Some("Binary file"),
+            (Content::TooLarge, _) | (_, Content::TooLarge) => Some("File too large to display"),
+            _ if change.old_path.is_some() => Some("Renamed without content changes"),
+            _ => Some("No content changes"),
+        };
+        let halves = [
+            Half::new(&change, 0, removed, message),
+            Half::new(&change, 1, added, message),
+        ];
 
         let this = Rc::new_cyclic(|weak_self| FileView {
-            widget,
+            halves,
             change,
             shared,
             texts,
@@ -282,47 +316,48 @@ impl FileView {
             blocks,
             collapsed: Cell::new(collapsed),
             layout: RefCell::default(),
-            body,
-            placeholder,
-            linkmap: gtk::DrawingArea::new(),
-            decorations: gtk::DrawingArea::new(),
-            toggle_label,
-            comment_count,
             cards: RefCell::default(),
-            width: Cell::new(0),
             on_toggle: RefCell::default(),
             weak_self: weak_self.clone(),
         });
-        this.decorations.set_can_target(false);
-        this.body.add_overlay(&this.decorations);
-        let weak = Rc::downgrade(&this);
-        this.decorations.connect_resize(move |_, width, _| {
-            let Some(this) = weak.upgrade() else { return };
-            if this.width.replace(width) != width && !this.cards.borrow().is_empty() {
-                // Cards wrap differently now; not during allocation, though.
-                let weak = this.weak_self.clone();
-                glib::idle_add_local_once(move || {
+        for (side, half) in this.halves.iter().enumerate() {
+            let weak = Rc::downgrade(&this);
+            half.decorations.connect_resize(move |_, width, _| {
+                let Some(this) = weak.upgrade() else { return };
+                let changed = this.halves[side].width.replace(width) != width;
+                if changed && !this.cards.borrow().is_empty() {
+                    // Cards wrap differently now; not during allocation, though.
+                    let weak = this.weak_self.clone();
+                    glib::idle_add_local_once(move || {
+                        if let Some(this) = weak.upgrade() {
+                            this.relayout();
+                        }
+                    });
+                }
+            });
+            let weak = Rc::downgrade(&this);
+            half.body.connect_get_child_position(move |_, child| {
+                weak.upgrade().and_then(|this| this.card_rect(side, child))
+            });
+            if this.texts.is_some() {
+                let weak = Rc::downgrade(&this);
+                half.header().connect_clicked(move |_| {
                     if let Some(this) = weak.upgrade() {
-                        this.relayout();
+                        this.set_collapsed(!this.collapsed.get());
                     }
                 });
             }
-        });
-        let weak = Rc::downgrade(&this);
-        this.body.connect_get_child_position(move |_, child| {
-            weak.upgrade().and_then(|this| this.card_rect(child))
-        });
+        }
         if this.texts.is_some() {
-            let weak = Rc::downgrade(&this);
-            header.connect_clicked(move |_| {
-                if let Some(this) = weak.upgrade() {
-                    this.set_collapsed(!this.collapsed.get());
-                }
-            });
             this.update_toggle_label();
             this.relayout();
         }
         this
+    }
+
+    /// The file's part of the left (0) or right (1) column.
+    pub fn section(&self, side: usize) -> &gtk::Box {
+        &self.halves[side].widget
     }
 
     /// Old and new side, if the text views have been built.
@@ -369,23 +404,20 @@ impl FileView {
             }
             this.relayout();
         });
-        self.linkmap
-            .set_draw_func(with_weak(&self.weak_self, FileView::draw_linkmap));
-        self.decorations
-            .set_draw_func(with_weak(&self.weak_self, FileView::draw_decorations));
-
-        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        self.linkmap.set_content_width(LINKMAP_WIDTH);
-        self.linkmap.add_css_class("linkmap");
-        hbox.append(&sides[0].scroller);
-        hbox.append(&self.linkmap);
-        hbox.append(&sides[1].scroller);
-        for (i, side) in sides.iter().enumerate() {
+        for (i, (side, half)) in sides.iter().zip(&self.halves).enumerate() {
+            let weak = self.weak_self.clone();
+            half.decorations.set_draw_func(move |_, cr, w, h| {
+                if let Some(this) = weak.upgrade() {
+                    this.draw_decorations(i, cr, w, h);
+                }
+            });
             self.setup_comment_input(i, side);
         }
         let _ = self.sides.set(sides);
         self.relayout();
-        self.body.set_child(Some(&hbox));
+        for (side, half) in self.sides().unwrap().iter().zip(&self.halves) {
+            half.body.set_child(Some(&side.scroller));
+        }
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -406,11 +438,13 @@ impl FileView {
 
     fn update_toggle_label(&self) {
         let collapsed = self.collapsed.get();
-        self.toggle_label.set_label(if collapsed {
-            "Show full file"
-        } else {
-            "Show changes only"
-        });
+        for half in &self.halves {
+            half.toggle_label.set_label(if collapsed {
+                "Show full file"
+            } else {
+                "Show changes only"
+            });
+        }
     }
 
     /// Called after the file is switched between "changes only" and "full file".
@@ -460,9 +494,10 @@ impl FileView {
         hits
     }
 
-    /// y of the top of the diff body (where line y = 0 is) in `target`'s coordinates.
-    pub fn body_y(&self, target: &impl IsA<gtk::Widget>) -> Option<f64> {
-        self.body
+    /// y of the top of one side's body (where line y = 0 is) in `target`'s coordinates.
+    pub fn body_y(&self, side: usize, target: &impl IsA<gtk::Widget>) -> Option<f64> {
+        self.halves[side]
+            .body
             .compute_point(target, &graphene::Point::zero())
             .map(|p| p.y() as f64)
     }
@@ -530,17 +565,23 @@ impl FileView {
         for ((card, _), y) in self.cards.borrow().iter().zip(&layout.notes) {
             card.widget.set_visible(y.is_some());
         }
-        self.body.queue_allocate();
-        if let Some([old, new]) = self.sides() {
-            old.apply_layout(&layout.sides[0]);
-            new.apply_layout(&layout.sides[1]);
-            self.linkmap.set_content_height(layout.height);
-            self.linkmap.queue_draw();
-            self.decorations.queue_draw();
-        } else {
-            self.placeholder.set_height_request(layout.height);
+        for (side, half) in self.halves.iter().enumerate() {
+            half.body.queue_allocate();
+            // Also makes room for a gap band below the last visible line.
+            let height = layout.height[side];
+            match self.sides() {
+                Some(sides) => {
+                    sides[side].apply_layout(&layout.sides[side]);
+                    sides[side].scroller.set_height_request(height);
+                    half.decorations.queue_draw();
+                }
+                None => half.placeholder.set_height_request(height),
+            }
         }
         *self.layout.borrow_mut() = layout;
+        if let Some(f) = &*self.shared.on_relayout.borrow() {
+            f();
+        }
     }
 
     fn root(&self) -> String {
@@ -558,17 +599,19 @@ impl FileView {
 
     /// Shows these comments, keeping any that are being edited as they are.
     pub fn set_comments(&self, list: Vec<Comment>) {
-        let n = list.len();
-        self.comment_count
-            .set_label(&format!("{n} comment{}", if n == 1 { "" } else { "s" }));
-        self.comment_count.set_visible(n > 0);
+        for (side, half) in self.halves.iter().enumerate() {
+            let n = list.iter().filter(|c| c.side.index() == side).count();
+            half.comment_count
+                .set_label(&format!("{n} comment{}", if n == 1 { "" } else { "s" }));
+            half.comment_count.set_visible(n > 0);
+        }
         let mut cards = self.cards.borrow_mut();
         let mut kept = Vec::new();
         for (card, loc) in cards.drain(..) {
             if card.editor.is_some() {
                 kept.push((card, loc));
             } else {
-                self.body.remove_overlay(&card.widget);
+                self.remove_card_widget(&card);
             }
         }
         drop(cards);
@@ -583,7 +626,7 @@ impl FileView {
             }
         } else {
             for (card, _) in &kept {
-                self.body.remove_overlay(&card.widget);
+                self.remove_card_widget(card);
             }
             kept.clear();
         }
@@ -606,9 +649,16 @@ impl FileView {
                 this.on_card_action(&id, action);
             }
         });
+        let side = comment.side.index();
         let card = Card::new(comment, outdated, editing, act);
-        self.body.add_overlay(&card.widget);
+        self.halves[side].body.add_overlay(&card.widget);
         card
+    }
+
+    fn remove_card_widget(&self, card: &Card) {
+        self.halves[card.comment.side.index()]
+            .body
+            .remove_overlay(&card.widget);
     }
 
     fn focus_editor(&self, id: &str) {
@@ -633,7 +683,7 @@ impl FileView {
             return;
         };
         let (old, loc) = cards.remove(i);
-        self.body.remove_overlay(&old.widget);
+        self.remove_card_widget(&old);
         if let Some(editing) = editing {
             let card = self.make_card(old.comment, loc.outdated, editing);
             cards.insert(i, (card, loc));
@@ -787,67 +837,103 @@ impl FileView {
         side.view.add_controller(click);
     }
 
-    fn side_width(&self) -> i32 {
-        if let Some(w) = self
-            .sides()
-            .map(|s| s[0].scroller.width())
-            .filter(|&w| w > 0)
-        {
-            return w;
-        }
-        match self.body.width() {
+    fn side_width(&self, side: usize) -> i32 {
+        match self.halves[side].body.width() {
             0 => 600,
-            w => ((w - LINKMAP_WIDTH) / 2).max(100),
+            w => w,
         }
     }
 
-    /// Space each card needs, measured at the width of its pane.
+    /// Space each card needs, measured at the width of its side.
     fn notes(&self) -> Vec<Note> {
-        let width = self.side_width() - 2 * CARD_MARGIN;
         self.cards
             .borrow()
             .iter()
-            .map(|(card, loc)| Note {
-                side: card.comment.side.index(),
-                lines: loc.lines.clone(),
-                height: card.height_for(width) + 2 * CARD_MARGIN,
+            .map(|(card, loc)| {
+                let side = card.comment.side.index();
+                let width = self.side_width(side) - 2 * CARD_MARGIN;
+                Note {
+                    side,
+                    lines: loc.lines.clone(),
+                    height: card.height_for(width) + 2 * CARD_MARGIN,
+                }
             })
             .collect()
     }
 
-    /// Where a card goes in the body overlay.
-    fn card_rect(&self, child: &gtk::Widget) -> Option<gdk::Rectangle> {
+    /// Where a card goes in its side's body overlay.
+    fn card_rect(&self, side: usize, child: &gtk::Widget) -> Option<gdk::Rectangle> {
         let cards = self.cards.borrow();
         let layout = self.layout.borrow();
         let i = cards
             .iter()
             .position(|(c, _)| c.widget.upcast_ref::<gtk::Widget>() == child)?;
         let y = (*layout.notes.get(i)?)?;
-        let side = cards[i].0.comment.side.index();
-        let width = self.side_width();
-        let x = self
-            .sides()
-            .and_then(|s| s[side].scroller.compute_bounds(&self.body))
-            .map_or(side as i32 * (width + LINKMAP_WIDTH), |b| b.x() as i32);
-        let w = width - 2 * CARD_MARGIN;
+        let w = self.side_width(side) - 2 * CARD_MARGIN;
         let h = cards[i].0.height_for(w);
-        Some(gdk::Rectangle::new(x + CARD_MARGIN, y + CARD_MARGIN, w, h))
+        Some(gdk::Rectangle::new(CARD_MARGIN, y + CARD_MARGIN, w, h))
     }
 
-    /// The meld-style curved bands connecting each chunk on the left to its counterpart.
-    fn draw_linkmap(&self, cr: &cairo::Context, width: i32, _height: i32) {
-        let layout = self.layout.borrow();
-        let w = width as f64;
+    /// Draws the meld-style bands linking this file's header and chunks on the left to their
+    /// counterparts on the right, in the window's link map. `tops` is where this file's
+    /// sections start on each side, in the link map's coordinates.
+    pub fn draw_links(&self, cr: &cairo::Context, width: f64, height: f64, tops: [f64; 2]) {
+        let fg = self.halves[0].widget.color();
+        let body = [0, 1].map(|s| {
+            let half = &self.halves[s];
+            tops[s] + self.body_y(s, &half.widget).unwrap_or(0.0)
+        });
         cr.set_line_width(1.0);
-        for chunk in &layout.chunks {
-            let (l0, l1) = (chunk.left.0 as f64 + 0.5, chunk.left.1 as f64 - 0.5);
-            let (r0, r1) = (chunk.right.0 as f64 + 0.5, chunk.right.1 as f64 - 0.5);
+        let band = |cr: &cairo::Context, (l0, l1): (f64, f64), (r0, r1): (f64, f64)| {
             let (l1, r1) = (l1.max(l0), r1.max(r0));
-            cr.move_to(0.0, l0);
-            cr.curve_to(w * 0.5, l0, w * 0.5, r0, w, r0);
-            cr.line_to(w, r1);
-            cr.curve_to(w * 0.5, r1, w * 0.5, l1, 0.0, l1);
-            cr.close_path();
+            // If one end is off screen, only a stub on the other side, like meld.
+            let off = |a: f64, b: f64| b < 0.0 || a > height;
+            if off(r0, r1) {
+                if l1 <= l0 + 1.0 {
+                    return false;
+                }
+                rounded_stub(cr, 0.0, l0, l1, 1.0);
+            } else if off(l0, l1) {
+                if r1 <= r0 + 1.0 {
+                    return false;
+                }
+                rounded_stub(cr, width, r0, r1, -1.0);
+            } else {
+                cr.move_to(-0.5, l0);
+                cr.curve_to(width * 0.5, l0, width * 0.5, r0, width + 0.5, r0);
+                cr.line_to(width + 0.5, r1);
+                cr.curve_to(width * 0.5, r1, width * 0.5, l1, -0.5, l1);
+                cr.close_path();
+            }
+            true
+        };
+
+        // The headers, so it's clear which files go together.
+        let (r, g, b) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
+        if band(cr, (tops[0], body[0]), (tops[1], body[1])) {
+            cr.set_source_rgba(r, g, b, 0.07);
+            let _ = cr.fill();
+        }
+
+        let layout = self.layout.borrow();
+        if self.sides().is_none() {
+            return;
+        }
+        for chunk in &layout.chunks {
+            let l = (
+                body[0] + chunk.left.0 as f64 + 0.5,
+                body[0] + chunk.left.1 as f64 - 0.5,
+            );
+            let r = (
+                body[1] + chunk.right.0 as f64 + 0.5,
+                body[1] + chunk.right.1 as f64 - 0.5,
+            );
+            if l.1.max(l.0) < 0.0 && r.1.max(r.0) < 0.0 || l.0 > height && r.0 > height {
+                continue;
+            }
+            if !band(cr, l, r) {
+                continue;
+            }
             let (r, g, b) = kind_color(chunk.kind);
             cr.set_source_rgba(r, g, b, 0.28);
             let _ = cr.fill_preserve();
@@ -856,28 +942,24 @@ impl FileView {
         }
     }
 
-    /// Chunk borders across both views, insertion markers and the "hidden lines" bands.
-    fn draw_decorations(&self, cr: &cairo::Context, width: i32, _height: i32) {
-        let (Some([old, new]), layout) = (self.sides(), self.layout.borrow()) else {
+    /// One side's chunk borders, comment highlights and "hidden lines" bands.
+    fn draw_decorations(&self, side: usize, cr: &cairo::Context, width: i32, _height: i32) {
+        let layout = self.layout.borrow();
+        if self.sides().is_none() {
             return;
-        };
-        let area = &self.decorations;
-        let bounds = |s: &Side| {
-            s.scroller
-                .compute_bounds(area)
-                .map(|b| (b.x() as f64, (b.x() + b.width()) as f64))
-                .unwrap_or((0.0, 0.0))
-        };
-        let (left, right) = (bounds(old), bounds(new));
-        let hline = |(x0, x1): (f64, f64), y: f64| {
-            cr.move_to(x0, y);
-            cr.line_to(x1, y);
+        }
+        let area = &self.halves[side].decorations;
+        let w = width as f64;
+        let hline = |y: f64| {
+            cr.move_to(0.0, y);
+            cr.line_to(w, y);
         };
 
         let lh = layout.line_height() as f64;
         for (card, loc) in self.cards.borrow().iter() {
-            let side = card.comment.side.index();
-            let (x0, x1) = [left, right][side];
+            if card.comment.side.index() != side {
+                continue;
+            }
             let y0 = layout.line_y(side, loc.lines.start) as f64;
             let y1 = layout.line_y(side, loc.lines.end - 1) as f64 + lh;
             let (r, g, b) = if card.comment.resolved {
@@ -886,37 +968,35 @@ impl FileView {
                 COMMENT_COLOR
             };
             cr.set_source_rgba(r, g, b, 0.10);
-            cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+            cr.rectangle(0.0, y0, w, y1 - y0);
             let _ = cr.fill();
             cr.set_source_rgba(r, g, b, 0.9);
-            cr.rectangle(x0, y0, 3.0, y1 - y0);
+            cr.rectangle(0.0, y0, 3.0, y1 - y0);
             let _ = cr.fill();
         }
 
         cr.set_line_width(1.0);
         for chunk in &layout.chunks {
             let (r, g, b) = kind_color(chunk.kind);
-            for ((y0, y1), span) in [(chunk.left, left), (chunk.right, right)] {
-                hline(span, y0 as f64 + 0.5);
-                if y1 > y0 {
-                    hline(span, y1 as f64 - 0.5);
-                }
+            let (y0, y1) = [chunk.left, chunk.right][side];
+            hline(y0 as f64 + 0.5);
+            if y1 > y0 {
+                hline(y1 as f64 - 0.5);
             }
             cr.set_source_rgba(r, g, b, 0.7);
             let _ = cr.stroke();
         }
 
         let fg = area.color();
-        let w = width as f64;
         for gap in &layout.gaps {
-            let (y, h) = (gap.y as f64, gap.height as f64);
+            let (y, h) = (gap.y[side] as f64, gap.height as f64);
             cr.rectangle(0.0, y, w, h);
             cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.05);
             let _ = cr.fill();
             cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.25);
             cr.set_dash(&[3.0, 3.0], 0.0);
-            hline((0.0, w), y + 0.5);
-            hline((0.0, w), y + h - 0.5);
+            hline(y + 0.5);
+            hline(y + h - 0.5);
             let _ = cr.stroke();
             cr.set_dash(&[], 0.0);
 
@@ -932,6 +1012,21 @@ impl FileView {
             pangocairo::functions::show_layout(cr, &text_layout);
         }
     }
+}
+
+/// A band hugging one edge of the link map (`dir` 1 for the left, -1 for the right), for a
+/// chunk whose counterpart is off screen.
+fn rounded_stub(cr: &cairo::Context, x: f64, y0: f64, y1: f64, dir: f64) {
+    const RADIUS: f64 = 3.0;
+    let q = std::f64::consts::FRAC_PI_2;
+    if dir > 0.0 {
+        cr.arc(x - 0.5, y0 + RADIUS, RADIUS, q * 3.0, 0.0);
+        cr.arc(x - 0.5, y1 - RADIUS, RADIUS, 0.0, q);
+    } else {
+        cr.arc_negative(x + 0.5, y0 + RADIUS, RADIUS, q * 3.0, q * 2.0);
+        cr.arc_negative(x + 0.5, y1 - RADIUS, RADIUS, q * 2.0, q);
+    }
+    cr.close_path();
 }
 
 /// Line numbers drawn by our own renderer: the built-in one squashes the numbers of hidden
@@ -969,18 +1064,6 @@ fn add_line_numbers(view: &sourceview5::View, buffer: &sourceview5::Buffer, hidd
 
 fn fold_case(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
-}
-
-fn with_weak(
-    weak: &Weak<FileView>,
-    f: fn(&FileView, &cairo::Context, i32, i32),
-) -> impl Fn(&gtk::DrawingArea, &cairo::Context, i32, i32) + 'static {
-    let weak = weak.clone();
-    move |_, cr, w, h| {
-        if let Some(this) = weak.upgrade() {
-            f(&this, cr, w, h)
-        }
-    }
 }
 
 pub fn status_class(status: char) -> &'static str {

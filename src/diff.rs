@@ -138,7 +138,7 @@ pub fn diff_inline(old: &str, new: &str) -> Option<InlineChanges> {
     ))
 }
 
-/// Vertical geometry of a changed chunk, in pixels from the top of the diff body.
+/// Vertical geometry of a changed chunk, in pixels from the top of each side's body.
 #[derive(Clone, Debug)]
 pub struct ChunkGeom {
     pub kind: ChunkKind,
@@ -146,10 +146,11 @@ pub struct ChunkGeom {
     pub right: (i32, i32),
 }
 
-/// A run of hidden unchanged lines, drawn as a separator band.
+/// A run of hidden unchanged lines, drawn as a separator band on both sides.
 #[derive(Clone, Debug)]
 pub struct Gap {
-    pub y: i32,
+    /// y on each side.
+    pub y: [i32; 2],
     pub height: i32,
     pub hidden: usize,
 }
@@ -174,7 +175,7 @@ impl Note {
 pub struct SideLayout {
     /// Line ranges to hide.
     pub hidden: Vec<Range<usize>>,
-    /// Extra pixels above a line, used to keep both sides aligned.
+    /// Extra pixels above a line, for the gap bands and notes.
     pub pad_above: BTreeMap<usize, i32>,
     /// (first line, y) for each run of consecutive visible lines.
     runs: Vec<(usize, i32)>,
@@ -196,9 +197,14 @@ pub struct Layout {
     pub sides: [SideLayout; 2],
     pub chunks: Vec<ChunkGeom>,
     pub gaps: Vec<Gap>,
-    /// y of the space reserved for each note, `None` if its lines aren't in the file.
+    /// y of the space reserved for each note on its side, `None` if its lines aren't in the file.
     pub notes: Vec<Option<i32>>,
-    pub height: i32,
+    /// Height of each side.
+    pub height: [i32; 2],
+    /// Pairs of corresponding y positions on the two sides, increasing on both, from the top
+    /// to the bottom of both sides. Scrolling one side moves the other by interpolating
+    /// between them.
+    pub anchors: Vec<[i32; 2]>,
     line_height: i32,
 }
 
@@ -216,6 +222,12 @@ impl Layout {
     pub fn line_height(&self) -> i32 {
         self.line_height
     }
+
+    fn anchor(&mut self, y: [i32; 2]) {
+        if self.anchors.last() != Some(&y) {
+            self.anchors.push(y);
+        }
+    }
 }
 
 /// Sorts ranges and merges the ones that overlap or touch, dropping empty ones.
@@ -232,17 +244,18 @@ fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     out
 }
 
-/// Computes which lines to hide and how much to pad, so that the two sides line up:
-/// every run of unchanged lines starts at the same height on both sides, and each changed
-/// chunk occupies the height of its taller side. Notes get their height reserved below their
-/// last line: across both sides among unchanged lines, on their own side within a chunk.
+/// Lays out each side on its own, one line after the other, like meld: the sides aren't
+/// padded to line up, the anchors say which heights correspond. Collapsed files hide the
+/// same unchanged lines on both sides, leaving a gap band in their place. Notes get their
+/// height reserved below their last line, on their own side.
 pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i32) -> Layout {
     let mut l = Layout {
         line_height: lh,
         notes: vec![None; notes.len()],
+        anchors: vec![[0, 0]],
         ..Default::default()
     };
-    let mut y = 0;
+    let mut y = [0, 0];
     let mut pending = [0, 0];
 
     for (i, block) in blocks.iter().enumerate() {
@@ -286,14 +299,15 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                             side.hidden.push(s + pos..s + r.start);
                         }
                         // When hidden up to the end of the file, the band goes below the last
-                        // visible line, in the space the link map's height adds below the text.
+                        // visible line, in the space the body's height adds below the text.
+                        l.anchor(y);
                         l.gaps.push(Gap {
                             y,
                             height: gap,
                             hidden: r.start - pos,
                         });
                         pending = pending.map(|p| p + gap);
-                        y += gap;
+                        y = y.map(|y| y + gap);
                     }
                     let mut seg = r.start;
                     while seg < r.end {
@@ -301,14 +315,17 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                             .range(seg..r.end)
                             .next()
                             .map_or(r.end, |(&k, _)| k + 1);
-                        for ((side, &s), p) in l.sides.iter_mut().zip(&starts).zip(&mut pending) {
-                            side.start_run(s + seg, y, p);
+                        for (side, (sl, &s)) in l.sides.iter_mut().zip(&starts).enumerate() {
+                            sl.start_run(s + seg, y[side], &mut pending[side]);
                         }
-                        y += (stop - seg) as i32 * lh;
+                        l.anchor(y);
+                        y = y.map(|y| y + (stop - seg) as i32 * lh);
+                        l.anchor(y);
                         for &ni in slots.get(&(stop - 1)).into_iter().flatten() {
-                            l.notes[ni] = Some(y);
-                            pending = pending.map(|p| p + notes[ni].height);
-                            y += notes[ni].height;
+                            let side = notes[ni].side;
+                            l.notes[ni] = Some(y[side]);
+                            pending[side] += notes[ni].height;
+                            y[side] += notes[ni].height;
                         }
                         seg = stop;
                     }
@@ -316,9 +333,9 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                 }
             }
             Block::Change(ref c) => {
-                let mut heights = [0, 0];
+                l.anchor(y);
+                let top = y;
                 for (side, range) in [&c.old, &c.new].into_iter().enumerate() {
-                    let mut sy = y;
                     let mut seg = range.start;
                     while seg < range.end {
                         let on_side = || {
@@ -330,32 +347,44 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                             .map(|(_, n)| n.last() + 1)
                             .min()
                             .unwrap_or(range.end);
-                        l.sides[side].start_run(seg, sy, &mut pending[side]);
-                        sy += (stop - seg) as i32 * lh;
+                        l.sides[side].start_run(seg, y[side], &mut pending[side]);
+                        y[side] += (stop - seg) as i32 * lh;
                         for (ni, n) in on_side().filter(|(_, n)| n.last() == stop - 1) {
-                            l.notes[ni] = Some(sy);
+                            l.notes[ni] = Some(y[side]);
                             pending[side] += n.height;
-                            sy += n.height;
+                            y[side] += n.height;
                         }
                         seg = stop;
                     }
-                    heights[side] = sy - y;
                 }
-                let [a, b] = heights;
                 l.chunks.push(ChunkGeom {
                     kind: c.kind,
-                    left: (y, y + a),
-                    right: (y, y + b),
+                    left: (top[0], y[0]),
+                    right: (top[1], y[1]),
                 });
-                let m = a.max(b);
-                pending[0] += m - a;
-                pending[1] += m - b;
-                y += m;
+                l.anchor(y);
             }
         }
     }
+    l.anchor(y);
     l.height = y;
     l
+}
+
+/// Maps a y position on side `from` to the other side, interpolating between the anchors
+/// around it (meld's scroll syncing). Past either end, the sides move together.
+pub fn map_y(anchors: &[[f64; 2]], from: usize, y: f64) -> f64 {
+    let to = 1 - from;
+    let i = anchors.partition_point(|a| a[from] < y);
+    match (i.checked_sub(1).map(|i| anchors[i]), anchors.get(i).copied()) {
+        (Some(a), Some(b)) => {
+            let span = b[from] - a[from];
+            let t = if span > 0.0 { (y - a[from]) / span } else { 1.0 };
+            a[to] + t * (b[to] - a[to])
+        }
+        (None, Some(a)) | (Some(a), None) => a[to] + y - a[from],
+        (None, None) => y,
+    }
 }
 
 #[cfg(test)]
@@ -374,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_aligns_and_hides() {
+    fn layout_hides_without_padding() {
         let old: String = (0..20).map(|i| format!("{i}\n")).collect();
         let new = old.replace("10\n", "ten\nTEN\n");
         let blocks = diff_lines(&old, &new);
@@ -385,11 +414,29 @@ mod tests {
         assert_eq!(l.gaps.len(), 2);
         assert_eq!(l.chunks[0].left, (35, 45));
         assert_eq!(l.chunks[0].right, (35, 55));
-        // the old side gets padded after the shorter chunk
-        assert_eq!(l.sides[0].pad_above.get(&11), Some(&10));
-        assert_eq!(l.line_y(0, 11), 55);
+        // each side just continues after the chunk
+        assert!(l.sides[0].pad_above.get(&11).is_none());
+        assert_eq!(l.line_y(0, 11), 45);
         assert_eq!(l.line_y(1, 12), 55);
-        assert_eq!(l.height, 90);
+        assert_eq!(l.gaps[1].y, [75, 85]);
+        assert_eq!(l.height, [80, 90]);
+        assert_eq!(l.anchors.first(), Some(&[0, 0]));
+        assert_eq!(l.anchors.last(), Some(&[80, 90]));
+        assert!(l.anchors.contains(&[35, 35]) && l.anchors.contains(&[45, 55]));
+        assert!(l.anchors.windows(2).all(|w| w[0][0] <= w[1][0] && w[0][1] <= w[1][1]));
+    }
+
+    #[test]
+    fn map_y_interpolates_between_anchors() {
+        // an insertion of 20px on the right at y = 10
+        let anchors = [[0.0, 0.0], [10.0, 10.0], [10.0, 30.0], [20.0, 40.0]];
+        assert_eq!(map_y(&anchors, 0, 5.0), 5.0);
+        assert_eq!(map_y(&anchors, 0, 10.0), 10.0);
+        assert_eq!(map_y(&anchors, 0, 15.0), 35.0);
+        assert_eq!(map_y(&anchors, 1, 20.0), 10.0);
+        assert_eq!(map_y(&anchors, 1, 35.0), 15.0);
+        assert_eq!(map_y(&anchors, 0, 25.0), 45.0);
+        assert_eq!(map_y(&anchors, 0, -5.0), -5.0);
     }
 
     #[test]
@@ -421,17 +468,20 @@ mod tests {
         let l = layout(&blocks, &notes, true, 10, 5);
         assert_eq!(l.sides[0].hidden, vec![0..1, 3..7, 14..20]);
         assert_eq!(l.sides[1].hidden, vec![0..1, 3..7, 15..21]);
-        // gap, lines 1-2, then the note
+        // gap, lines 1-2, then the note, on the new side only
         assert_eq!(l.notes[0], Some(25));
         assert_eq!(l.line_y(1, 1), 5);
-        // note + gap pad the next visible line
-        assert_eq!(l.sides[0].pad_above.get(&7), Some(&12));
-        assert_eq!(l.line_y(0, 7), 37);
-        // gap(5) + 2 lines + note(7) + gap(5) + 3 context lines = 67; the change starts there
+        // note + gap pad the next visible line on the new side, the gap alone on the old
+        assert_eq!(l.sides[0].pad_above.get(&7), Some(&5));
+        assert_eq!(l.sides[1].pad_above.get(&7), Some(&12));
+        assert_eq!(l.line_y(0, 7), 30);
+        assert_eq!(l.line_y(1, 7), 37);
+        assert!(l.anchors.contains(&[25, 25]) && l.anchors.contains(&[30, 37]));
+        assert_eq!(l.chunks[0].left, (60, 70));
         assert_eq!(l.chunks[0].right, (67, 67 + 10 + 30 + 10));
         assert_eq!(l.notes[1], Some(77));
         assert_eq!(l.line_y(1, 11), 107);
-        assert_eq!(l.chunks[0].left, (67, 77));
-        assert_eq!(l.line_y(0, 11), l.line_y(1, 12));
+        assert_eq!(l.line_y(0, 11), 70);
+        assert_eq!(l.line_y(1, 12), 117);
     }
 }

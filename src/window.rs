@@ -1,6 +1,12 @@
 //! Main window: file tree sidebar, the sequence of file diffs, and search.
+//!
+//! The diff is two columns, old files on the left and new ones on the right, each scrolling
+//! on its own like meld's panes, with the link map between them. Scrolling one column
+//! scrolls the other to the corresponding place: the point at the middle of the view (the
+//! top or bottom near the ends) is mapped across through each file's layout anchors.
 
 use crate::comments::{self, Listener};
+use crate::diff;
 use crate::file_view::{self, FileView, Shared};
 use crate::git::{self, Options};
 use crate::tree::{self, Node};
@@ -27,8 +33,15 @@ pub struct Window {
     tree_model: gtk::TreeListModel,
     selection: gtk::SingleSelection,
     tree_view: gtk::ListView,
-    scroller: gtk::ScrolledWindow,
-    content: gtk::Box,
+    /// The old (left) and new (right) column.
+    scrollers: [gtk::ScrolledWindow; 2],
+    contents: [gtk::Box; 2],
+    linkmap: gtk::DrawingArea,
+    /// The column last scrolled by the user, which the other follows.
+    master: Cell<usize>,
+    /// Set while one column scrolls the other.
+    scroll_lock: Cell<bool>,
+    sync_queued: Cell<bool>,
     files: RefCell<Vec<Rc<FileView>>>,
     shared: Rc<Shared>,
     synced_file: Cell<Option<usize>>,
@@ -43,6 +56,21 @@ pub struct Window {
     tagged: Cell<Option<(usize, usize)>>,
     /// Receives the keys other processes write to the comment database.
     listener: Option<Listener>,
+}
+
+const LINKMAP_WIDTH: i32 = 44;
+
+/// Where in the view the columns are synced, as a fraction of its height: the middle, but
+/// moving to the top in the first half screen and to the bottom in the last one, so both
+/// columns can reach their ends (meld's `calc_syncpoint`).
+fn syncpoint(adj: &gtk::Adjustment) -> f64 {
+    let half = adj.page_size() / 2.0;
+    if half <= 0.0 {
+        return 0.0;
+    }
+    let first = (adj.value() - adj.lower()) / half;
+    let last = (adj.upper() - adj.page_size() - adj.value()) / half;
+    0.5 * first.min(1.0) + 0.5 * (1.0 - last.clamp(0.0, 1.0))
 }
 
 fn style_scheme() -> Option<sourceview5::StyleScheme> {
@@ -150,17 +178,37 @@ impl Window {
             .build();
 
         // Diff content
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.add_css_class("diff-content");
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&content)
-            .hexpand(true)
+        let contents = [(); 2].map(|_| {
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.add_css_class("diff-content");
+            content
+        });
+        let scrollers = contents.each_ref().map(|content| {
+            // Otherwise clicking a line scrolls its whole file's text view into view.
+            let viewport = gtk::Viewport::builder()
+                .scroll_to_focus(false)
+                .child(content)
+                .build();
+            gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(&viewport)
+                .hexpand(true)
+                .build()
+        });
+        // Scrollbars on the outer edges, so both sides can sit against the link map.
+        scrollers[0].set_placement(gtk::CornerType::TopRight);
+        let linkmap = gtk::DrawingArea::builder()
+            .content_width(LINKMAP_WIDTH)
             .build();
+        linkmap.add_css_class("linkmap");
+        let columns = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        columns.append(&scrollers[0]);
+        columns.append(&linkmap);
+        columns.append(&scrollers[1]);
 
         let paned = gtk::Paned::builder()
             .start_child(&sidebar)
-            .end_child(&scroller)
+            .end_child(&columns)
             .position(280)
             .shrink_start_child(false)
             .resize_start_child(false)
@@ -192,6 +240,7 @@ impl Window {
             scheme: RefCell::new(style_scheme()),
             search_settings,
             on_line_height: RefCell::default(),
+            on_relayout: RefCell::default(),
             root: RefCell::default(),
             author: glib::user_name().to_string_lossy().into_owned(),
         });
@@ -209,8 +258,12 @@ impl Window {
             tree_model,
             selection,
             tree_view,
-            scroller,
-            content,
+            scrollers,
+            contents,
+            linkmap,
+            master: Cell::new(0),
+            scroll_lock: Cell::new(false),
+            sync_queued: Cell::new(false),
             files: RefCell::default(),
             shared,
             synced_file: Cell::new(None),
@@ -382,27 +435,64 @@ impl Window {
             }
         });
 
-        let weak = Rc::downgrade(self);
-        self.scroller.vadjustment().connect_value_changed(move |_| {
-            if let Some(this) = weak.upgrade() {
+        for (side, scroller) in self.scrollers.iter().enumerate() {
+            let adj = scroller.vadjustment();
+            let weak = Rc::downgrade(self);
+            adj.connect_value_changed(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                if !this.scroll_lock.get() {
+                    this.master.set(side);
+                    this.sync_scroll();
+                }
+                this.linkmap.queue_draw();
                 this.build_visible();
                 this.sync_sidebar();
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.scroller
-            .vadjustment()
-            .connect_page_size_notify(move |_| {
+            });
+            // The size of the content or the view changed, which moves the anchors. This is
+            // emitted during allocation, so the other column follows once that's done.
+            let weak = Rc::downgrade(self);
+            adj.connect_changed(move |_| {
                 if let Some(this) = weak.upgrade() {
+                    this.queue_sync();
                     this.build_visible();
                 }
             });
+        }
+        let weak = Rc::downgrade(self);
+        self.linkmap.set_draw_func(move |_, cr, w, h| {
+            if let Some(this) = weak.upgrade() {
+                this.draw_linkmap(cr, w, h);
+            }
+        });
+        // Scrolling over the link map scrolls the column that leads.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        let weak = Rc::downgrade(self);
+        scroll.connect_scroll(move |ctl, _, dy| {
+            let Some(this) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let adj = this.scrollers[this.master.get()].vadjustment();
+            let step = match ctl.unit() {
+                gtk::gdk::ScrollUnit::Wheel => adj.page_size().powf(2.0 / 3.0),
+                _ => 1.0,
+            };
+            adj.set_value(adj.value() + dy * step);
+            glib::Propagation::Stop
+        });
+        self.linkmap.add_controller(scroll);
+
         let weak = Rc::downgrade(self);
         *self.shared.on_line_height.borrow_mut() = Some(Box::new(move || {
             if let Some(this) = weak.upgrade() {
                 for f in this.files.borrow().iter() {
                     f.relayout();
                 }
+            }
+        }));
+        let weak = Rc::downgrade(self);
+        *self.shared.on_relayout.borrow_mut() = Some(Box::new(move || {
+            if let Some(this) = weak.upgrade() {
+                this.queue_sync();
             }
         }));
 
@@ -489,7 +579,7 @@ impl Window {
     }
 
     pub fn load(self: &Rc<Self>) {
-        let scroll = self.scroller.vadjustment().value();
+        let scroll = self.scrollers[0].vadjustment().value();
         if self.files.borrow().is_empty() {
             self.stack.set_visible_child_name("loading");
         }
@@ -533,8 +623,10 @@ impl Window {
         )));
 
         // Clear any previous contents (reload).
-        while let Some(child) = self.content.first_child() {
-            self.content.remove(&child);
+        for content in &self.contents {
+            while let Some(child) = content.first_child() {
+                content.remove(&child);
+            }
         }
         self.tree_store.remove_all();
         self.matches.borrow_mut().clear();
@@ -581,7 +673,7 @@ impl Window {
             let fv = FileView::new(change, self.shared.clone(), !full);
             if eager_height < 2000 && scroll == 0.0 {
                 fv.ensure_built();
-                eager_height += fv.layout.borrow().height + 40;
+                eager_height += fv.layout.borrow().height[0] + 40;
             }
             let weak = Rc::downgrade(self);
             fv.connect_toggle(move || {
@@ -589,7 +681,9 @@ impl Window {
                     this.refresh_search(false);
                 }
             });
-            self.content.append(&fv.widget);
+            for (side, content) in self.contents.iter().enumerate() {
+                content.append(fv.section(side));
+            }
             files.push(fv);
         }
         let mut by_path: std::collections::HashMap<String, Vec<comments::Comment>> =
@@ -611,7 +705,9 @@ impl Window {
 
         let this = self.clone();
         glib::idle_add_local_once(move || {
-            this.scroller.vadjustment().set_value(scroll);
+            this.master.set(0);
+            this.scrollers[0].vadjustment().set_value(scroll);
+            this.sync_scroll();
             this.build_visible();
             this.sync_sidebar();
         });
@@ -623,18 +719,26 @@ impl Window {
         }
     }
 
-    fn file_top(&self, i: usize) -> Option<f64> {
+    /// y of the top of a file in a column.
+    fn file_top(&self, side: usize, i: usize) -> Option<f64> {
         let files = self.files.borrow();
         let p = files
             .get(i)?
-            .widget
-            .compute_point(&self.content, &graphene::Point::zero())?;
+            .section(side)
+            .compute_point(&self.contents[side], &graphene::Point::zero())?;
         Some(p.y() as f64)
     }
 
+    /// Scrolls one column to `y`, and the other one along.
+    fn scroll_column(&self, side: usize, y: f64) {
+        self.master.set(side);
+        self.scrollers[side].vadjustment().set_value(y);
+        self.sync_scroll();
+    }
+
     fn scroll_to_file(&self, i: usize) {
-        if let Some(y) = self.file_top(i) {
-            self.scroller.vadjustment().set_value(y);
+        if let Some(y) = self.file_top(0, i) {
+            self.scroll_column(0, y);
         }
     }
 
@@ -646,40 +750,143 @@ impl Window {
         self.scroll_to_file(i);
     }
 
-    /// Builds the text views of files in or near the viewport.
-    fn build_visible(&self) {
-        let adj = self.scroller.vadjustment();
-        if adj.page_size() <= 0.0 {
-            return;
-        }
-        let (lo, hi) = (
-            adj.value() - adj.page_size(),
-            adj.value() + 2.0 * adj.page_size(),
-        );
+    /// Corresponding heights of the two columns, increasing on both, in content coordinates:
+    /// the top of each file's sections and its layout's anchors.
+    fn anchors(&self) -> Vec<[f64; 2]> {
+        let mut anchors = vec![[0.0, 0.0]];
         for f in self.files.borrow().iter() {
-            let Some(p) = f
-                .widget
-                .compute_point(&self.content, &graphene::Point::zero())
-            else {
+            let (Some(l), Some(r)) = (
+                f.body_y(0, &self.contents[0]),
+                f.body_y(1, &self.contents[1]),
+            ) else {
                 continue;
             };
-            let top = p.y() as f64;
-            if top > hi {
+            let tops = [0, 1].map(|s| {
+                f.section(s)
+                    .compute_point(&self.contents[s], &graphene::Point::zero())
+                    .map_or(0.0, |p| p.y() as f64)
+            });
+            anchors.push(tops);
+            let layout = f.layout.borrow();
+            anchors.extend(
+                layout
+                    .anchors
+                    .iter()
+                    .map(|&[a, b]| [l + a as f64, r + b as f64]),
+            );
+        }
+        anchors.push(self.contents.each_ref().map(|c| c.height() as f64));
+        // Allocations can lag behind; keep it monotonic.
+        for i in 1..anchors.len() {
+            let prev = anchors[i - 1];
+            anchors[i] = [anchors[i][0].max(prev[0]), anchors[i][1].max(prev[1])];
+        }
+        anchors
+    }
+
+    /// Scrolls the other column to follow the master one, like meld's `_sync_vscroll`.
+    fn sync_scroll(&self) {
+        if self.scroll_lock.get() {
+            return;
+        }
+        let master = self.master.get();
+        let src = self.scrollers[master].vadjustment();
+        let dst = self.scrollers[1 - master].vadjustment();
+        let point = syncpoint(&src);
+        let y = src.value() + src.page_size() * point;
+        let other = diff::map_y(&self.anchors(), master, y);
+        let max = (dst.upper() - dst.page_size()).max(dst.lower());
+        let value = (other - dst.page_size() * point).clamp(dst.lower(), max).floor();
+        self.scroll_lock.set(true);
+        dst.set_value(value);
+        self.scroll_lock.set(false);
+        self.linkmap.queue_draw();
+    }
+
+    /// Syncs the columns once the current allocation is done.
+    fn queue_sync(self: &Rc<Self>) {
+        self.linkmap.queue_draw();
+        if self.sync_queued.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(this) = weak.upgrade() {
+                this.sync_queued.set(false);
+                this.sync_scroll();
+            }
+        });
+    }
+
+    fn draw_linkmap(&self, cr: &gtk::cairo::Context, width: i32, height: i32) {
+        let (w, h) = (width as f64, height as f64);
+        let values = self.scrollers.each_ref().map(|s| s.vadjustment().value());
+        // Where each column's top is in the link map; normally both at 0.
+        let offsets = [0, 1].map(|s| {
+            self.scrollers[s]
+                .compute_point(&self.linkmap, &graphene::Point::zero())
+                .map_or(0.0, |p| p.y() as f64)
+        });
+        for f in self.files.borrow().iter() {
+            let mut tops = [0.0; 2];
+            let mut bottoms = [0.0; 2];
+            for s in 0..2 {
+                let section = f.section(s);
+                let Some(p) =
+                    section.compute_point(&self.contents[s], &graphene::Point::zero())
+                else {
+                    continue;
+                };
+                tops[s] = p.y() as f64 - values[s] + offsets[s];
+                bottoms[s] = tops[s] + section.height() as f64;
+            }
+            if tops[0] > h && tops[1] > h {
                 break;
             }
-            if top + f.widget.height() as f64 >= lo {
-                f.ensure_built();
+            if bottoms[0] < 0.0 && bottoms[1] < 0.0 {
+                continue;
+            }
+            f.draw_links(cr, w, h, tops);
+        }
+    }
+
+    /// Builds the text views of files in or near the viewport of either column.
+    fn build_visible(&self) {
+        for (side, scroller) in self.scrollers.iter().enumerate() {
+            let adj = scroller.vadjustment();
+            if adj.page_size() <= 0.0 {
+                continue;
+            }
+            let (lo, hi) = (
+                adj.value() - adj.page_size(),
+                adj.value() + 2.0 * adj.page_size(),
+            );
+            for f in self.files.borrow().iter() {
+                let section = f.section(side);
+                let Some(p) =
+                    section.compute_point(&self.contents[side], &graphene::Point::zero())
+                else {
+                    continue;
+                };
+                let top = p.y() as f64;
+                if top > hi {
+                    break;
+                }
+                if top + section.height() as f64 >= lo {
+                    f.ensure_built();
+                }
             }
         }
     }
 
     /// Selects the file at the top of the viewport in the sidebar.
     fn sync_sidebar(&self) {
-        let top = self.scroller.vadjustment().value() + 1.0;
+        let side = self.master.get();
+        let top = self.scrollers[side].vadjustment().value() + 1.0;
         let n = self.files.borrow().len();
         let mut current = None;
         for i in 0..n {
-            match self.file_top(i) {
+            match self.file_top(side, i) {
                 Some(y) if y <= top => current = Some(i),
                 Some(_) => break,
                 None => {}
@@ -744,8 +951,7 @@ impl Window {
             self.search_entry.remove_css_class("error");
         }
         if jump && count > 0 {
-            let top = self.scroller.vadjustment().value();
-            let first = (0..count).find(|&i| self.match_y(i).is_some_and(|y| y >= top));
+            let first = (0..count).find(|&i| self.match_below_top(i));
             self.goto_match(first.unwrap_or(0));
         } else {
             self.update_search_label();
@@ -763,14 +969,20 @@ impl Window {
         self.search_label.set_label(&text);
     }
 
-    /// y of a match in content coordinates.
-    fn match_y(&self, i: usize) -> Option<f64> {
+    /// Column and y of a match in that column's content coordinates.
+    fn match_y(&self, i: usize) -> Option<(usize, f64)> {
         let matches = self.matches.borrow();
         let m = matches.get(i)?;
         let files = self.files.borrow();
         let fv = &files[m.file];
         let y = fv.layout.borrow().line_y(m.side, m.line);
-        Some(fv.body_y(&self.content)? + y as f64)
+        Some((m.side, fv.body_y(m.side, &self.contents[m.side])? + y as f64))
+    }
+
+    /// Whether a match is below the top of the view of its column.
+    fn match_below_top(&self, i: usize) -> bool {
+        self.match_y(i)
+            .is_some_and(|(side, y)| y >= self.scrollers[side].vadjustment().value())
     }
 
     fn step_search(&self, forward: bool) {
@@ -787,8 +999,7 @@ impl Window {
             Some(c) if forward => (c + 1) % n,
             Some(c) => (c + n - 1) % n,
             None => {
-                let top = self.scroller.vadjustment().value();
-                let below = (0..n).find(|&i| self.match_y(i).is_some_and(|y| y >= top));
+                let below = (0..n).find(|&i| self.match_below_top(i));
                 match (forward, below) {
                     (true, b) => b.unwrap_or(0),
                     (false, Some(b)) => (b + n - 1) % n,
@@ -818,7 +1029,9 @@ impl Window {
         self.clear_current_tag();
         self.current.set(Some(i));
         self.update_search_label();
-        let Some(y) = self.match_y(i) else { return };
+        let Some((column, y)) = self.match_y(i) else {
+            return;
+        };
         let matches = self.matches.borrow();
         let m = &matches[i];
         let files = self.files.borrow();
@@ -836,10 +1049,10 @@ impl Window {
         side.buffer.apply_tag(&side.current, &start, &end);
         self.tagged.set(Some((m.file, m.side)));
 
-        let vadj = self.scroller.vadjustment();
+        let vadj = self.scrollers[column].vadjustment();
         let page = vadj.page_size();
         if y < vadj.value() + 20.0 || y > vadj.value() + page - 60.0 {
-            vadj.set_value(y - page / 3.0);
+            self.scroll_column(column, y - page / 3.0);
         }
         let hadj = side.scroller.hadjustment();
         let x = side.view.iter_location(&start).x() as f64;

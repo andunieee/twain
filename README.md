@@ -3,7 +3,9 @@
 A GTK4 diff viewer for git repositories. Like meld, but shows every changed file in one
 scrolling sequence instead of one tab per file.
 
-- Side-by-side diffs with meld-style curved links between changed chunks and intra-line highlights
+- Side-by-side diffs like meld: old and new files each flow normally in their own column with
+  its own scrollbar, kept in sync as you scroll, with curved links between changed chunks and
+  intra-line highlights
 - Only changed regions are shown (3 lines of context); click a file header to see the full file
 - Syntax highlighting and real line numbers (GtkSourceView)
 - File tree sidebar: click to jump to a file, double-click to show it in full
