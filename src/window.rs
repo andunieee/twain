@@ -191,6 +191,8 @@ impl Window {
                 .build();
             gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
+                // A permanent scrollbar rather than an indicator that only shows on hover.
+                .overlay_scrolling(false)
                 .child(&viewport)
                 .hexpand(true)
                 .build()

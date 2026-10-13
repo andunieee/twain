@@ -53,6 +53,27 @@ const CSS: &str = r#"
 .comment-badge.warning { color: @warning_color; background: alpha(@warning_color, 0.15); }
 .comment-badge.success { color: @success_color; background: alpha(@success_color, 0.15); }
 .comment-count { color: #c88a0e; font-size: smaller; font-weight: bold; }
+scrollbar slider {
+    min-width: 12px;
+    min-height: 12px;
+    margin: 0;
+    border: 3px solid transparent;
+    border-radius: 9px;
+    background-clip: padding-box;
+    background-color: alpha(currentColor, 0.45);
+}
+scrollbar.vertical slider { min-height: 48px; }
+scrollbar.horizontal slider { min-width: 48px; }
+scrollbar slider:hover { background-color: alpha(currentColor, 0.6); }
+scrollbar slider:active { background-color: alpha(currentColor, 0.8); }
+scrollbar.overlay-indicator:not(.hovering) slider {
+    min-width: 8px;
+    min-height: 8px;
+    border-width: 2px;
+    background-color: alpha(currentColor, 0.45);
+}
+scrollbar.overlay-indicator:not(.hovering).vertical slider { min-height: 48px; }
+scrollbar.overlay-indicator:not(.hovering).horizontal slider { min-width: 48px; }
 "#;
 
 fn main() -> glib::ExitCode {
