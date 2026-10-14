@@ -284,7 +284,7 @@ impl Window {
 
         let status = adw::StatusPage::new();
         let stack = gtk::Stack::new();
-        stack.add_named(&adw::Spinner::new(), Some("loading"));
+        stack.add_named(&gtk::Spinner::new(), Some("loading"));
         stack.add_named(&status, Some("status"));
         stack.add_named(&paned, Some("diff"));
 

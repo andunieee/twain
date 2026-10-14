@@ -5,7 +5,10 @@ license = "GPL-3.0-or-later"
 edition = "2024"
 
 [dependencies]
-adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
+# Keep the libadwaita floor at 1.5 (the version Ubuntu 24.04 ships) so the
+# binary release job builds on stock runners. The only 1.6 API we used was
+# AdwSpinner, which GtkSpinner covers.
+adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
 pangocairo = "0.22"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
