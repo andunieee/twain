@@ -1,7 +1,8 @@
 //! Comments on lines of files, shared between every twain process.
 //!
-//! Comments live in one LMDB environment (`$XDG_DATA_HOME/twain/comments`) that all twain
-//! processes — windows and `twain comment` invocations — keep open at the same time. Keys are
+//! Comments live in one LMDB environment (`$XDG_DATA_HOME/twain/comments`, the host's one
+//! also from Flatpak) that all twain processes — windows and `twain comment` invocations —
+//! keep open at the same time. Keys are
 //!
 //! ```text
 //! <repo root> \0 <repo-relative path> \0 <id>
@@ -10,7 +11,8 @@
 //! so a repository's comments, or one file's, are a prefix scan away. Values are JSON.
 //!
 //! After committing a write, a process sends the key it wrote as a datagram to every socket in
-//! `$XDG_DATA_HOME/twain/processes/` (each listening process binds one named after its pid),
+//! `$XDG_DATA_HOME/twain/processes/` (each listening process binds one with a random name;
+//! not the pid, since every Flatpak sandbox has its own pid namespace and they all collide),
 //! and the receivers decide from the key whether they need to requery. Sockets left behind by
 //! dead processes are removed by the first sender that gets refused.
 
@@ -168,7 +170,14 @@ pub fn now() -> i64 {
 }
 
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
+    // Inside Flatpak, XDG_DATA_HOME points into the sandbox's own ~/.var/app directory; use
+    // the host's instead, so the Flatpak and a twain installed on the host share comments.
+    let var = if std::env::var_os("FLATPAK_ID").is_some() {
+        "HOST_XDG_DATA_HOME"
+    } else {
+        "XDG_DATA_HOME"
+    };
+    let base = std::env::var_os(var)
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -180,6 +189,21 @@ pub fn data_dir() -> PathBuf {
 
 fn processes_dir() -> PathBuf {
     data_dir().join("processes")
+}
+
+/// This process's socket name in `processes_dir`.
+fn socket_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        format!("{}-{:016x}", std::process::id(), h.finish())
+    })
 }
 
 /// Socket addresses are limited to about 100 bytes. Longer paths are reached through a
@@ -393,7 +417,7 @@ fn notify(keys: &[Vec<u8>]) {
     };
     // Never block on a process that isn't reading its socket.
     let _ = sock.set_nonblocking(true);
-    let me = std::process::id().to_string();
+    let me = socket_name();
     let dir = processes_dir();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -433,11 +457,9 @@ impl Listener {
     pub fn bind() -> io::Result<Listener> {
         let dir = processes_dir();
         std::fs::create_dir_all(&dir)?;
-        let name = std::process::id().to_string();
-        let path = dir.join(&name);
-        // Left behind by an earlier process with the same pid.
-        let _ = std::fs::remove_file(&path);
-        let (addr, _dir_fd) = socket_addr(&dir, &name)?;
+        let name = socket_name();
+        let path = dir.join(name);
+        let (addr, _dir_fd) = socket_addr(&dir, name)?;
         let sock = UnixDatagram::bind(&addr)?;
         Ok(Listener { sock, path })
     }
