@@ -1,0 +1,127 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    name: binary (linux/${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-24.04
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.0-dev+$(git rev-parse --short HEAD)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dist
+          strip target/release/twain
+          cp target/release/twain "dist/twain-$VERSION-linux-${{ matrix.arch }}"
+          tar -czf "dist/twain-$VERSION-linux-${{ matrix.arch }}.tar.gz" \
+            -C dist "twain-$VERSION-linux-${{ matrix.arch }}" \
+            -C "$GITHUB_WORKSPACE" README.md
+          rm "dist/twain-$VERSION-linux-${{ matrix.arch }}"
+          (cd dist && sha256sum "twain-$VERSION-linux-${{ matrix.arch }}.tar.gz" \
+            > "twain-$VERSION-linux-${{ matrix.arch }}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-linux-${{ matrix.arch }}
+          path: dist/*
+
+  cargo-sources:
+    name: flatpak cargo sources
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate flatpak/cargo-sources.json from Cargo.lock
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install aiohttp tomlkit
+          curl -sSL -o "$RUNNER_TEMP/fcg.py" \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/fcg.py" Cargo.lock -o flatpak/cargo-sources.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-sources
+          path: flatpak/cargo-sources.json
+
+  flatpak:
+    name: flatpak (linux/${{ matrix.arch }})
+    needs: cargo-sources
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-24.04
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-sources
+          path: flatpak
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: twain-linux-${{ matrix.arch }}.flatpak
+          manifest-path: flatpak/io.github.andunieee.twain.yml
+          arch: ${{ matrix.arch }}
+          artifact-name: flatpak-linux-${{ matrix.arch }}
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binary, flatpak]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: '{binary,flatpak}-*'
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -103,7 +103,7 @@ fn main() -> glib::ExitCode {
     };
 
     let app = adw::Application::builder()
-        .application_id("io.github.twain")
+        .application_id("io.github.andunieee.twain")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_startup(|app| {

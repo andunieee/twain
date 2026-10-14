@@ -61,8 +61,22 @@ all of them.
 ## Building
 
 Needs GTK ≥ 4.12, GtkSourceView 5 and libadwaita ≥ 1.6 (on Arch:
-`pacman -S gtk4 gtksourceview5 libadwaita`).
+`pacman -S gtk4 gtksourceview5 libadwaita`; on Debian/Ubuntu:
+`apt install libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev`).
 
 ```
 cargo install --path .
+```
+
+## Releases
+
+Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`, which
+builds a single binary per Linux arch (`twain-<version>-linux-<arch>.tar.gz`,
+needs the GTK system libs above to run) and a Flatpak bundle
+(`twain-linux-<arch>.flatpak`, runs anywhere), then attaches all of them to
+a GitHub release:
+
+```
+flatpak install twain-linux-x86_64.flatpak
+flatpak run io.github.andunieee.twain
 ```

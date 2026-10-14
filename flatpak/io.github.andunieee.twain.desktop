@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Twain
+Comment=A GTK4 diff viewer for git repositories
+Exec=twain
+Icon=io.github.andunieee.twain
+Terminal=false
+Categories=Development;RevisionControl;

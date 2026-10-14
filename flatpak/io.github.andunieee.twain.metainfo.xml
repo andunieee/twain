@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.andunieee.twain</id>
+  <name>Twain</name>
+  <summary>A GTK4 diff viewer for git repositories</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <description>
+    <p>
+      Twain is a diff viewer for git repositories. Like meld, but it shows
+      every changed file in one scrolling sequence instead of one tab per
+      file: side-by-side diffs with curved links between changed chunks,
+      intra-line highlights, syntax highlighting and real line numbers.
+    </p>
+    <p>
+      Only changed regions are shown with a few lines of context. A file tree
+      sidebar jumps to any file, search covers the whole diff, and selected
+      lines can carry review comments.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.andunieee.twain.desktop</launchable>
+  <provides>
+    <binary>twain</binary>
+  </provides>
+</component>

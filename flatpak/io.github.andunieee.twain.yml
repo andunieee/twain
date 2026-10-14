@@ -1,0 +1,48 @@
+app-id: io.github.andunieee.twain
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: twain
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # diff viewer must read arbitrary git checkouts on the host
+  - --filesystem=host
+modules:
+  # The app shells out to `git`, which is not in the GNOME runtime,
+  # so bundle it.
+  - name: git
+    buildsystem: autotools
+    config-opts:
+      - --without-tcltk
+    sources:
+      - type: archive
+        url: https://www.kernel.org/pub/software/scm/git/git-2.51.0.tar.xz
+        sha256: 60a7c2251cc2e588d5cd87bae567260617c6de0c22dca9cdbfc4c7d2b8990b62
+
+  - name: twain
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/twain/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --locked
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/twain /app/bin/twain
+      - install -Dm644 flatpak/io.github.andunieee.twain.desktop /app/share/applications/io.github.andunieee.twain.desktop
+      - install -Dm644 flatpak/io.github.andunieee.twain.metainfo.xml /app/share/metainfo/io.github.andunieee.twain.metainfo.xml
+      - install -Dm644 flatpak/io.github.andunieee.twain.svg /app/share/icons/hicolor/scalable/apps/io.github.andunieee.twain.svg
+    sources:
+      - type: dir
+        path: ..
+      # Generated from Cargo.lock by the release workflow (not committed).
+      # This entry expands to the vendored crate sources flatpak-builder
+      # fetches up front, so the build itself needs no network.
+      - cargo-sources.json
