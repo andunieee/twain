@@ -54,7 +54,7 @@ impl Side {
         // The buffer would show a trailing newline as an extra empty line.
         let text = text.strip_suffix('\n').unwrap_or(text);
         buffer.set_text(text);
-        if !crate::syntax::highlight(&buffer, text, path, scheme)
+        if !crate::syntax::highlight(&buffer, text, path)
             && let Some(lang) =
                 sourceview5::LanguageManager::default().guess_language(Some(path), None)
         {
@@ -600,7 +600,7 @@ impl FileView {
     pub fn set_style_scheme(&self, scheme: Option<&sourceview5::StyleScheme>) {
         for side in self.sides().into_iter().flatten() {
             side.buffer.set_style_scheme(scheme);
-            crate::syntax::set_style_scheme(&side.buffer, scheme);
+            crate::syntax::recolor(&side.buffer);
         }
     }
 

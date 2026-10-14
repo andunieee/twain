@@ -1,8 +1,8 @@
 //! Tree-sitter highlighting for the grammars compiled into twain. Files no grammar handles
 //! fall back to GtkSourceView's own highlighting.
 //!
-//! Highlights are plain text tags named `syntax:<capture>`, colored from the GtkSourceView
-//! style scheme so they follow the light/dark theme like everything else.
+//! Highlights are plain text tags named `syntax:<capture>`, colored from twain's own palette:
+//! the Adwaita style schemes only have colors for a dozen kinds of token.
 
 use gtk::prelude::*;
 use std::cell::RefCell;
@@ -12,34 +12,93 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter}
 /// Larger files are left to GtkSourceView, which highlights lazily.
 const MAX_LEN: usize = 2 << 20;
 
-/// Capture names we color, each with the scheme styles to try in order: schemes only define
-/// some `def:` styles and rely on GtkSourceView's language files to map the others.
-/// Captures match their longest listed prefix, so `function.method` uses `function`.
-const HIGHLIGHTS: &[(&str, &[&str])] = &[
-    ("attribute", &["def:preprocessor"]),
-    ("boolean", &["def:boolean", "def:constant"]),
-    ("character", &["def:character", "def:constant"]),
-    ("comment", &["def:comment"]),
-    ("constant", &["def:constant"]),
-    (
-        "constant.builtin",
-        &["def:special-constant", "def:constant"],
-    ),
-    ("constructor", &["def:type"]),
-    ("escape", &["def:special-char"]),
-    ("function", &["def:function"]),
-    ("function.builtin", &["def:builtin", "def:function"]),
-    ("function.macro", &["def:preprocessor"]),
-    ("keyword", &["def:keyword", "def:statement"]),
-    ("label", &["def:preprocessor"]),
-    ("number", &["def:number"]),
-    ("operator", &["def:operator"]),
-    ("punctuation.special", &["def:special-char"]),
-    ("string", &["def:string"]),
-    ("string.special", &["def:special-char", "def:string"]),
-    ("tag", &["def:keyword", "def:statement"]),
-    ("type", &["def:type"]),
-    ("variable.builtin", &["def:builtin", "def:statement"]),
+/// A color for light and one for dark mode, from the GNOME palette.
+type Color = (&'static str, &'static str);
+
+const KEYWORD: Color = ("#813d9c", "#dc8add");
+const STRING: Color = ("#26773a", "#8ff0a4");
+const SPECIAL: Color = ("#a51d2d", "#f66151");
+const CONSTANT: Color = ("#c64600", "#ffa348");
+const TYPE: Color = ("#0b6e7f", "#5ec8d8");
+const FUNCTION: Color = ("#1a5fb4", "#99c1f1");
+const MACRO: Color = ("#8a6100", "#f8e45c");
+const PROPERTY: Color = ("#a3305b", "#f5a3c5");
+const MODULE: Color = ("#865e3c", "#cdab8f");
+const COMMENT: Color = ("#77767b", "#9a9996");
+const DOC: Color = ("#5e5c64", "#b0afac");
+
+#[derive(Clone, Copy)]
+struct Look {
+    color: Option<Color>,
+    bold: bool,
+    italic: bool,
+}
+
+const fn fg(color: Color) -> Look {
+    Look {
+        color: Some(color),
+        bold: false,
+        italic: false,
+    }
+}
+
+impl Look {
+    const fn bold(self) -> Look {
+        Look { bold: true, ..self }
+    }
+
+    const fn italic(self) -> Look {
+        Look {
+            italic: true,
+            ..self
+        }
+    }
+}
+
+const ITALIC: Look = Look {
+    color: None,
+    bold: false,
+    italic: true,
+};
+
+/// Capture names we color. A capture uses the listed name sharing the most dot-separated
+/// parts with it, so `function.method` uses `function` and `keyword.return` `keyword`.
+const HIGHLIGHTS: &[(&str, Look)] = &[
+    ("attribute", fg(MACRO)),
+    ("boolean", fg(CONSTANT)),
+    ("character", fg(STRING)),
+    ("charset", fg(KEYWORD).bold()),
+    ("comment", fg(COMMENT).italic()),
+    ("comment.documentation", fg(DOC).italic()),
+    ("conditional", fg(KEYWORD).bold()),
+    ("constant", fg(CONSTANT)),
+    ("constructor", fg(TYPE)),
+    ("escape", fg(SPECIAL)),
+    ("field", fg(PROPERTY)),
+    ("function", fg(FUNCTION)),
+    ("function.macro", fg(MACRO)),
+    ("import", fg(KEYWORD).bold()),
+    ("keyframes", fg(KEYWORD).bold()),
+    ("keyword", fg(KEYWORD).bold()),
+    ("label", fg(MODULE).italic()),
+    ("media", fg(KEYWORD).bold()),
+    ("method", fg(FUNCTION)),
+    ("module", fg(MODULE)),
+    ("namespace", fg(MODULE)),
+    ("number", fg(CONSTANT)),
+    ("parameter", ITALIC),
+    ("preproc", fg(MACRO)),
+    ("property", fg(PROPERTY)),
+    ("punctuation.special", fg(SPECIAL)),
+    ("repeat", fg(KEYWORD).bold()),
+    ("string", fg(STRING)),
+    ("string.special", fg(SPECIAL)),
+    ("string.special.key", fg(PROPERTY)),
+    ("string.special.symbol", fg(CONSTANT)),
+    ("supports", fg(KEYWORD).bold()),
+    ("tag", fg(TYPE)),
+    ("type", fg(TYPE)),
+    ("variable.builtin", fg(KEYWORD).italic()),
 ];
 
 struct Lang {
@@ -214,13 +273,7 @@ static LANGS: [Lang; 17] = [
     }),
     Lang::new("rust", &["rs"], || {
         use tree_sitter_rust as l;
-        config(
-            l::LANGUAGE,
-            "rust",
-            l::HIGHLIGHTS_QUERY,
-            l::INJECTIONS_QUERY,
-            "",
-        )
+        config(l::LANGUAGE, "rust", l::HIGHLIGHTS_QUERY, l::INJECTIONS_QUERY, "")
     }),
     Lang::new("toml", &["toml", "Cargo.lock"], || {
         use tree_sitter_toml_ng as l;
@@ -289,31 +342,13 @@ fn for_injection(name: &str) -> Option<&'static HighlightConfiguration> {
         .and_then(Lang::config)
 }
 
-/// Everything `Style::apply` may set, cleared before applying another style.
-const RESET: &[&str] = &[
-    "foreground-set",
-    "background-set",
-    "paragraph-background-set",
-    "weight-set",
-    "style-set",
-    "underline-set",
-    "underline-rgba-set",
-    "strikethrough-set",
-    "scale-set",
-];
-
 thread_local! {
     static HIGHLIGHTER: RefCell<Highlighter> = RefCell::new(Highlighter::new());
 }
 
 /// Highlights `buffer`, which holds `text`, with tree-sitter. Returns false, adding nothing,
 /// if no grammar handles `path`. Call it before adding other tags, so they take priority.
-pub fn highlight(
-    buffer: &sourceview5::Buffer,
-    text: &str,
-    path: &str,
-    scheme: Option<&sourceview5::StyleScheme>,
-) -> bool {
+pub fn highlight(buffer: &sourceview5::Buffer, text: &str, path: &str) -> bool {
     if text.len() > MAX_LEN {
         return false;
     }
@@ -329,7 +364,7 @@ pub fn highlight(
             tag
         })
         .collect();
-    set_style_scheme(buffer, scheme);
+    recolor(buffer);
 
     HIGHLIGHTER.with_borrow_mut(|highlighter| {
         let Ok(events) = highlighter.highlight(config, text.as_bytes(), None, None, |name| {
@@ -363,18 +398,22 @@ pub fn highlight(
     true
 }
 
-/// Recolors the syntax tags of `buffer`, if it has any.
-pub fn set_style_scheme(buffer: &sourceview5::Buffer, scheme: Option<&sourceview5::StyleScheme>) {
+/// Sets the colors of `buffer`'s syntax tags, if it has any, for light or dark mode.
+pub fn recolor(buffer: &sourceview5::Buffer) {
+    let dark = adw::StyleManager::default().is_dark();
     let table = buffer.tag_table();
-    for (name, styles) in HIGHLIGHTS {
+    for (name, look) in HIGHLIGHTS {
         let Some(tag) = table.lookup(&format!("syntax:{name}")) else {
             return;
         };
-        for prop in RESET {
-            tag.set_property(prop, false);
+        if let Some((light, dark_color)) = look.color {
+            tag.set_foreground(Some(if dark { dark_color } else { light }));
         }
-        if let Some(style) = scheme.and_then(|s| styles.iter().find_map(|id| s.style(id))) {
-            style.apply(&tag);
+        if look.bold {
+            tag.set_weight(700);
+        }
+        if look.italic {
+            tag.set_style(gtk::pango::Style::Italic);
         }
     }
 }
