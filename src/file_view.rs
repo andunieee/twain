@@ -50,13 +50,16 @@ impl Side {
         let buffer = sourceview5::Buffer::new(None);
         buffer.set_enable_undo(false);
         buffer.set_highlight_matching_brackets(false);
-        if let Some(lang) = sourceview5::LanguageManager::default().guess_language(Some(path), None)
+        buffer.set_style_scheme(scheme);
+        // The buffer would show a trailing newline as an extra empty line.
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        buffer.set_text(text);
+        if !crate::syntax::highlight(&buffer, text, path, scheme)
+            && let Some(lang) =
+                sourceview5::LanguageManager::default().guess_language(Some(path), None)
         {
             buffer.set_language(Some(&lang));
         }
-        buffer.set_style_scheme(scheme);
-        // The buffer would show a trailing newline as an extra empty line.
-        buffer.set_text(text.strip_suffix('\n').unwrap_or(text));
 
         let view = sourceview5::View::with_buffer(&buffer);
         view.set_editable(false);
@@ -597,6 +600,7 @@ impl FileView {
     pub fn set_style_scheme(&self, scheme: Option<&sourceview5::StyleScheme>) {
         for side in self.sides().into_iter().flatten() {
             side.buffer.set_style_scheme(scheme);
+            crate::syntax::set_style_scheme(&side.buffer, scheme);
         }
     }
 
