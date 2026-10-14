@@ -21,7 +21,8 @@
   <url type="bugtracker">https://github.com/andunieee/twain/issues</url>
   <screenshots>
     <screenshot type="default">
-      <image>https://andunieee.github.io/twain/screenshot.png</image>
+      <image>https://raw.githubusercontent.com/andunieee/twain/v0.1.0/screenshot.png</image>
+      <caption>Every changed file side by side in one scrolling view</caption>
     </screenshot>
   </screenshots>
   <launchable type="desktop-id">io.github.andunieee.twain.desktop</launchable>

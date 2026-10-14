@@ -3,7 +3,7 @@ name: pages
 on:
   push:
     branches: [master]
-    paths: [README.md, screenshot.png, .github/workflows/pages.yml]
+    paths: [README.md, screenshot2.png, .github/workflows/pages.yml]
   workflow_dispatch:
 
 permissions:
@@ -29,8 +29,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pandoc
           mkdir _site
-          cp screenshot.png flatpak/io.github.andunieee.twain.svg _site/
-          pandoc README.md --standalone --metadata pagetitle=twain \
+          cp screenshot2.png flatpak/io.github.andunieee.twain.svg _site/
+          sed 's/screenshot\.png/screenshot2.png/g' README.md | pandoc --standalone --metadata pagetitle=twain \
             --variable 'header-includes=<link rel="icon" href="io.github.andunieee.twain.svg">' \
             --variable 'header-includes=<style>body{max-width:52em} img{border-radius:8px}</style>' \
             -o _site/index.html
