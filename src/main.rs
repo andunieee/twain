@@ -11,7 +11,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 const CSS: &str = r#"
-.diff-content { padding-bottom: 300px; }
+.diff-content { padding-bottom: 30px; }
 .file-section { margin: 0 0 18px 0; }
 .file-header {
     border-radius: 0;

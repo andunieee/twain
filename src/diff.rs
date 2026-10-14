@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 /// Unchanged lines shown around each change when a file is collapsed.
 pub const CONTEXT: usize = 3;
+/// Runs of unchanged lines this short are never hidden.
+pub const MIN_HIDDEN: usize = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChunkKind {
@@ -153,6 +155,10 @@ pub struct Gap {
     pub y: [i32; 2],
     pub height: i32,
     pub hidden: usize,
+    /// The hidden lines, on the old side.
+    pub lines: Range<usize>,
+    /// The lines on the old side that are hidden when none are revealed, around `lines`.
+    pub region: Range<usize>,
 }
 
 /// Space reserved below some lines of one side, for a comment card.
@@ -197,6 +203,9 @@ pub struct Layout {
     pub sides: [SideLayout; 2],
     pub chunks: Vec<ChunkGeom>,
     pub gaps: Vec<Gap>,
+    /// Lines on each side that are hidden when none are revealed, for the regions with some
+    /// lines revealed.
+    pub revealed: Vec<[Range<usize>; 2]>,
     /// y of the space reserved for each note on its side, `None` if its lines aren't in the file.
     pub notes: Vec<Option<i32>>,
     /// Height of each side.
@@ -230,6 +239,17 @@ impl Layout {
     }
 }
 
+/// The parts of `ranges` outside `cut`.
+pub fn subtract(ranges: &[Range<usize>], cut: &Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for r in ranges {
+        out.push(r.start..r.end.min(cut.start));
+        out.push(r.start.max(cut.end)..r.end);
+    }
+    out.retain(|r| !r.is_empty());
+    out
+}
+
 /// Sorts ranges and merges the ones that overlap or touch, dropping empty ones.
 fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     ranges.retain(|r| !r.is_empty());
@@ -247,8 +267,16 @@ fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
 /// Lays out each side on its own, one line after the other, like meld: the sides aren't
 /// padded to line up, the anchors say which heights correspond. Collapsed files hide the
 /// same unchanged lines on both sides, leaving a gap band in their place. Notes get their
-/// height reserved below their last line, on their own side.
-pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i32) -> Layout {
+/// height reserved below their last line, on their own side. `revealed` are hidden lines
+/// (on the old side) shown anyway.
+pub fn layout(
+    blocks: &[Block],
+    notes: &[Note],
+    collapsed: bool,
+    revealed: &[Range<usize>],
+    lh: i32,
+    gap: i32,
+) -> Layout {
     let mut l = Layout {
         line_height: lh,
         notes: vec![None; notes.len()],
@@ -262,9 +290,10 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
         match *block {
             Block::Equal { old, new, len } => {
                 let starts = [old, new];
-                // Offsets within the block that stay visible. Blocks alternate, so any
-                // neighbour is a change.
-                let mut visible = Vec::new();
+                // Runs of hidden lines (offsets within the block), each with its region: the
+                // lines hidden when none are revealed. Blocks alternate, so any neighbour is
+                // a change.
+                let mut hidden: Vec<(Range<usize>, Range<usize>)> = Vec::new();
                 if collapsed {
                     let head = if i > 0 { CONTEXT.min(len) } else { 0 };
                     let tail = if i + 1 < blocks.len() {
@@ -272,7 +301,7 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                     } else {
                         0
                     };
-                    visible.extend([0..head, len - tail..len]);
+                    let mut visible = vec![0..head, len - tail..len];
                     for n in notes {
                         let s = starts[n.side];
                         let (a, b) = (n.lines.start.max(s), n.lines.end.min(s + len));
@@ -280,8 +309,31 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                             visible.push(a - s..b - s);
                         }
                     }
-                } else {
-                    visible.push(0..len);
+                    let shown = merge(
+                        revealed
+                            .iter()
+                            .map(|r| {
+                                r.start.clamp(old, old + len) - old
+                                    ..r.end.clamp(old, old + len) - old
+                            })
+                            .collect(),
+                    );
+                    let mut pos = 0;
+                    for v in merge(visible).into_iter().chain([len..len]) {
+                        if v.start > pos + MIN_HIDDEN {
+                            let region = pos..v.start;
+                            let mut runs = shown
+                                .iter()
+                                .fold(vec![region.clone()], |rs, c| subtract(&rs, c));
+                            runs.retain(|r| r.len() > MIN_HIDDEN);
+                            if runs.iter().map(|r| r.len()).sum::<usize>() < region.len() {
+                                l.revealed
+                                    .push(starts.map(|s| s + region.start..s + region.end));
+                            }
+                            hidden.extend(runs.into_iter().map(|r| (r, region.clone())));
+                        }
+                        pos = v.end;
+                    }
                 }
                 // Notes by the offset of the line they go below.
                 let mut slots: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -292,29 +344,14 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                     }
                 }
 
+                let at_old = |r: &Range<usize>| old + r.start..old + r.end;
                 let mut pos = 0;
-                for r in merge(visible).into_iter().chain([len..len]) {
-                    if r.start > pos {
-                        for (side, &s) in l.sides.iter_mut().zip(&starts) {
-                            side.hidden.push(s + pos..s + r.start);
-                        }
-                        // When hidden up to the end of the file, the band goes below the last
-                        // visible line, in the space the body's height adds below the text.
-                        l.anchor(y);
-                        l.gaps.push(Gap {
-                            y,
-                            height: gap,
-                            hidden: r.start - pos,
-                        });
-                        pending = pending.map(|p| p + gap);
-                        y = y.map(|y| y + gap);
-                    }
-                    let mut seg = r.start;
-                    while seg < r.end {
-                        let stop = slots
-                            .range(seg..r.end)
-                            .next()
-                            .map_or(r.end, |(&k, _)| k + 1);
+                for run in hidden.iter().map(Some).chain([None]) {
+                    // The visible lines up to the run.
+                    let end = run.map_or(len, |(r, _)| r.start);
+                    let mut seg = pos;
+                    while seg < end {
+                        let stop = slots.range(seg..end).next().map_or(end, |(&k, _)| k + 1);
                         for (side, (sl, &s)) in l.sides.iter_mut().zip(&starts).enumerate() {
                             sl.start_run(s + seg, y[side], &mut pending[side]);
                         }
@@ -329,7 +366,23 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
                         }
                         seg = stop;
                     }
-                    pos = r.end;
+                    let Some((run, region)) = run else { break };
+                    for (side, &s) in l.sides.iter_mut().zip(&starts) {
+                        side.hidden.push(s + run.start..s + run.end);
+                    }
+                    // When hidden up to the end of the file, the band goes below the last
+                    // visible line, in the space the body's height adds below the text.
+                    l.anchor(y);
+                    l.gaps.push(Gap {
+                        y,
+                        height: gap,
+                        hidden: run.len(),
+                        lines: at_old(run),
+                        region: at_old(region),
+                    });
+                    pending = pending.map(|p| p + gap);
+                    y = y.map(|y| y + gap);
+                    pos = run.end;
                 }
             }
             Block::Change(ref c) => {
@@ -376,10 +429,17 @@ pub fn layout(blocks: &[Block], notes: &[Note], collapsed: bool, lh: i32, gap: i
 pub fn map_y(anchors: &[[f64; 2]], from: usize, y: f64) -> f64 {
     let to = 1 - from;
     let i = anchors.partition_point(|a| a[from] < y);
-    match (i.checked_sub(1).map(|i| anchors[i]), anchors.get(i).copied()) {
+    match (
+        i.checked_sub(1).map(|i| anchors[i]),
+        anchors.get(i).copied(),
+    ) {
         (Some(a), Some(b)) => {
             let span = b[from] - a[from];
-            let t = if span > 0.0 { (y - a[from]) / span } else { 1.0 };
+            let t = if span > 0.0 {
+                (y - a[from]) / span
+            } else {
+                1.0
+            };
             a[to] + t * (b[to] - a[to])
         }
         (None, Some(a)) | (Some(a), None) => a[to] + y - a[from],
@@ -404,26 +464,66 @@ mod tests {
 
     #[test]
     fn layout_hides_without_padding() {
-        let old: String = (0..20).map(|i| format!("{i}\n")).collect();
-        let new = old.replace("10\n", "ten\nTEN\n");
+        let old: String = (0..40).map(|i| format!("{i}\n")).collect();
+        let new = old.replace("20\n", "twenty\nTWENTY\n");
         let blocks = diff_lines(&old, &new);
-        let l = layout(&blocks, &[], true, 10, 5);
-        // lines 0..7 hidden, 7..10 context, change, 11..14 context, rest hidden
-        assert_eq!(l.sides[0].hidden, vec![0..7, 14..20]);
-        assert_eq!(l.sides[1].hidden, vec![0..7, 15..21]);
+        let l = layout(&blocks, &[], true, &[], 10, 5);
+        // lines 0..17 hidden, 17..20 context, change, 21..24 context, rest hidden
+        assert_eq!(l.sides[0].hidden, vec![0..17, 24..40]);
+        assert_eq!(l.sides[1].hidden, vec![0..17, 25..41]);
         assert_eq!(l.gaps.len(), 2);
         assert_eq!(l.chunks[0].left, (35, 45));
         assert_eq!(l.chunks[0].right, (35, 55));
         // each side just continues after the chunk
-        assert!(l.sides[0].pad_above.get(&11).is_none());
-        assert_eq!(l.line_y(0, 11), 45);
-        assert_eq!(l.line_y(1, 12), 55);
+        assert!(l.sides[0].pad_above.get(&21).is_none());
+        assert_eq!(l.line_y(0, 21), 45);
+        assert_eq!(l.line_y(1, 22), 55);
         assert_eq!(l.gaps[1].y, [75, 85]);
         assert_eq!(l.height, [80, 90]);
         assert_eq!(l.anchors.first(), Some(&[0, 0]));
         assert_eq!(l.anchors.last(), Some(&[80, 90]));
         assert!(l.anchors.contains(&[35, 35]) && l.anchors.contains(&[45, 55]));
-        assert!(l.anchors.windows(2).all(|w| w[0][0] <= w[1][0] && w[0][1] <= w[1][1]));
+        assert!(
+            l.anchors
+                .windows(2)
+                .all(|w| w[0][0] <= w[1][0] && w[0][1] <= w[1][1])
+        );
+    }
+
+    #[test]
+    fn few_lines_are_never_hidden() {
+        let old: String = (0..20).map(|i| format!("{i}\n")).collect();
+        let new = old.replace("10\n", "ten\nTEN\n");
+        let l = layout(&diff_lines(&old, &new), &[], true, &[], 10, 5);
+        assert!(l.sides[0].hidden.is_empty() && l.sides[1].hidden.is_empty());
+        assert!(l.gaps.is_empty() && l.revealed.is_empty());
+    }
+
+    #[test]
+    fn revealed_lines_are_shown() {
+        let old: String = (0..40).map(|i| format!("{i}\n")).collect();
+        let new = old.replace("20\n", "twenty\nTWENTY\n");
+        let blocks = diff_lines(&old, &new);
+        // What's left hidden after 12..14 is too short to hide, as is what's left of the end.
+        let l = layout(&blocks, &[], true, &[12..14, 26..50], 10, 5);
+        assert_eq!(l.sides[0].hidden, vec![0..12]);
+        assert_eq!(l.sides[1].hidden, vec![0..12]);
+        let gaps: Vec<_> = l
+            .gaps
+            .iter()
+            .map(|g| (g.lines.clone(), g.region.clone()))
+            .collect();
+        assert_eq!(gaps, vec![(0..12, 0..17)]);
+        assert_eq!(l.line_y(0, 12), 5);
+        assert_eq!(l.line_y(0, 17), 55);
+        assert_eq!(l.revealed, vec![[0..17, 0..17], [24..40, 25..41]]);
+
+        // All of a region: no band left.
+        let l = layout(&blocks, &[], true, &[0..17], 10, 5);
+        assert_eq!(l.sides[0].hidden, vec![24..40]);
+        assert_eq!(l.gaps.len(), 1);
+        assert_eq!(l.line_y(0, 0), 0);
+        assert_eq!(l.revealed, vec![[0..17, 0..17]]);
     }
 
     #[test]
@@ -448,40 +548,41 @@ mod tests {
 
     #[test]
     fn notes_reserve_space_and_stay_visible() {
-        let old: String = (0..20).map(|i| format!("{i}\n")).collect();
-        let new = old.replace("10\n", "ten\nTEN\n");
+        let old: String = (0..40).map(|i| format!("{i}\n")).collect();
+        let new = old.replace("20\n", "twenty\nTWENTY\n");
         let blocks = diff_lines(&old, &new);
         let notes = [
             // In hidden unchanged lines: shown, space on both sides.
             Note {
                 side: 1,
-                lines: 1..3,
+                lines: 11..13,
                 height: 7,
             },
             // Inside the change, on the new side only.
             Note {
                 side: 1,
-                lines: 10..11,
+                lines: 20..21,
                 height: 30,
             },
         ];
-        let l = layout(&blocks, &notes, true, 10, 5);
-        assert_eq!(l.sides[0].hidden, vec![0..1, 3..7, 14..20]);
-        assert_eq!(l.sides[1].hidden, vec![0..1, 3..7, 15..21]);
-        // gap, lines 1-2, then the note, on the new side only
+        let l = layout(&blocks, &notes, true, &[], 10, 5);
+        // 13..17 would be too short to hide
+        assert_eq!(l.sides[0].hidden, vec![0..11, 24..40]);
+        assert_eq!(l.sides[1].hidden, vec![0..11, 25..41]);
+        // gap, lines 11-12, then the note, on the new side only
         assert_eq!(l.notes[0], Some(25));
-        assert_eq!(l.line_y(1, 1), 5);
-        // note + gap pad the next visible line on the new side, the gap alone on the old
-        assert_eq!(l.sides[0].pad_above.get(&7), Some(&5));
-        assert_eq!(l.sides[1].pad_above.get(&7), Some(&12));
-        assert_eq!(l.line_y(0, 7), 30);
-        assert_eq!(l.line_y(1, 7), 37);
-        assert!(l.anchors.contains(&[25, 25]) && l.anchors.contains(&[30, 37]));
-        assert_eq!(l.chunks[0].left, (60, 70));
-        assert_eq!(l.chunks[0].right, (67, 67 + 10 + 30 + 10));
-        assert_eq!(l.notes[1], Some(77));
-        assert_eq!(l.line_y(1, 11), 107);
-        assert_eq!(l.line_y(0, 11), 70);
-        assert_eq!(l.line_y(1, 12), 117);
+        assert_eq!(l.line_y(1, 11), 5);
+        // the note pads the next line on the new side
+        assert!(l.sides[0].pad_above.get(&13).is_none());
+        assert_eq!(l.sides[1].pad_above.get(&13), Some(&7));
+        assert_eq!(l.line_y(0, 13), 25);
+        assert_eq!(l.line_y(1, 13), 32);
+        assert!(l.anchors.contains(&[25, 25]) && l.anchors.contains(&[25, 32]));
+        assert_eq!(l.chunks[0].left, (95, 105));
+        assert_eq!(l.chunks[0].right, (102, 102 + 10 + 30 + 10));
+        assert_eq!(l.notes[1], Some(112));
+        assert_eq!(l.line_y(1, 21), 142);
+        assert_eq!(l.line_y(0, 21), 105);
+        assert_eq!(l.line_y(1, 22), 152);
     }
 }

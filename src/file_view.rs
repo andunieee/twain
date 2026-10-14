@@ -8,7 +8,7 @@
 
 use crate::comment_card::{Action, Card};
 use crate::comments::{self, Comment, Location, Side as CommentSide};
-use crate::diff::{self, Block, ChunkKind, Layout, Note};
+use crate::diff::{self, Block, ChunkKind, Gap, Layout, Note};
 use crate::git::{Content, FileChange};
 use gtk::prelude::*;
 use gtk::{cairo, gdk, gio, glib, graphene};
@@ -273,6 +273,10 @@ pub struct FileView {
     search_contexts: OnceCell<[sourceview5::SearchContext; 2]>,
     blocks: Vec<Block>,
     collapsed: Cell<bool>,
+    /// Hidden unchanged lines (on the old side) shown anyway, while collapsed.
+    revealed: RefCell<Vec<std::ops::Range<usize>>>,
+    /// The region (on the old side) the text's context menu offers to hide again.
+    menu_region: RefCell<Option<std::ops::Range<usize>>>,
     pub layout: RefCell<Layout>,
     /// Comment cards (including one being written) and where their lines are.
     cards: RefCell<Vec<(Card, Location)>>,
@@ -318,6 +322,8 @@ impl FileView {
             search_contexts: OnceCell::new(),
             blocks,
             collapsed: Cell::new(collapsed),
+            revealed: RefCell::default(),
+            menu_region: RefCell::default(),
             layout: RefCell::default(),
             cards: RefCell::default(),
             on_toggle: RefCell::default(),
@@ -343,6 +349,7 @@ impl FileView {
                 weak.upgrade().and_then(|this| this.card_rect(side, child))
             });
             if this.texts.is_some() {
+                this.setup_gap_input(side);
                 let weak = Rc::downgrade(&this);
                 half.header().connect_clicked(move |_| {
                     if let Some(this) = weak.upgrade() {
@@ -432,11 +439,143 @@ impl FileView {
             return;
         }
         self.collapsed.set(collapsed);
+        if collapsed {
+            self.revealed.borrow_mut().clear();
+        }
         self.update_toggle_label();
         self.relayout();
         if let Some(f) = &*self.on_toggle.borrow() {
             f();
         }
+    }
+
+    /// Shows these hidden lines (on the old side).
+    fn reveal(&self, lines: std::ops::Range<usize>) {
+        self.revealed.borrow_mut().push(lines);
+        self.relayout();
+    }
+
+    /// Hides again the revealed lines of a region.
+    fn unreveal(&self, region: &std::ops::Range<usize>) {
+        let revealed = diff::subtract(&self.revealed.borrow(), region);
+        *self.revealed.borrow_mut() = revealed;
+        self.relayout();
+    }
+
+    /// The gap band at `y` in one side's body.
+    fn gap_at(&self, side: usize, y: f64) -> Option<Gap> {
+        self.sides()?;
+        let layout = self.layout.borrow();
+        let y = y.floor() as i32;
+        let gap = layout
+            .gaps
+            .iter()
+            .find(|g| (g.y[side]..g.y[side] + g.height).contains(&y));
+        gap.cloned()
+    }
+
+    /// Clicking a gap band shows its lines; right-clicking it offers to show only some of
+    /// them. Revealed lines are hidden again from the text's context menu.
+    fn setup_gap_input(&self, side: usize) {
+        let body = &self.halves[side].body;
+        let click = gtk::GestureClick::builder().button(0).build();
+        // Before the text view under the band sees it.
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = self.weak_self.clone();
+        click.connect_pressed(move |gesture, n, x, y| {
+            let Some(this) = weak.upgrade() else { return };
+            let Some(gap) = this.gap_at(side, y) else {
+                return;
+            };
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            match gesture.current_button() {
+                gdk::BUTTON_SECONDARY => this.show_gap_menu(side, &gap, x, y),
+                gdk::BUTTON_PRIMARY if n == 1 => this.reveal(gap.region),
+                _ => {}
+            }
+        });
+        body.add_controller(click);
+
+        let motion = gtk::EventControllerMotion::new();
+        let weak = self.weak_self.clone();
+        let update_cursor = move |y: Option<f64>| {
+            let Some(this) = weak.upgrade() else { return };
+            let Some(sides) = this.sides() else { return };
+            let over = y.is_some_and(|y| this.gap_at(side, y).is_some());
+            sides[side]
+                .view
+                .set_cursor_from_name(Some(if over { "pointer" } else { "text" }));
+        };
+        let update = update_cursor.clone();
+        motion.connect_motion(move |_, _, y| update(Some(y)));
+        motion.connect_leave(move |_| update_cursor(None));
+        body.add_controller(motion);
+    }
+
+    fn show_gap_menu(&self, side: usize, gap: &Gap, x: f64, y: f64) {
+        let body = &self.halves[side].body;
+        let group = gio::SimpleActionGroup::new();
+        let menu = gio::Menu::new();
+        let shows = gio::Menu::new();
+        let add = |menu: &gio::Menu, label: &str, f: Box<dyn Fn(&FileView)>| {
+            let name = format!("a{}", group.list_actions().len());
+            let action = gio::SimpleAction::new(&name, None);
+            let weak = self.weak_self.clone();
+            action.connect_activate(move |_, _| {
+                if let Some(this) = weak.upgrade() {
+                    f(&this);
+                }
+            });
+            group.add_action(&action);
+            menu.append(Some(label), Some(&format!("gap.{name}")));
+        };
+        let lines = gap.lines.clone();
+        let n = lines.len();
+        let all = lines.clone();
+        add(
+            &shows,
+            &format!("Show All {n} Line{}", if n == 1 { "" } else { "s" }),
+            Box::new(move |t| t.reveal(all.clone())),
+        );
+        for k in [10, 50] {
+            // Unless what would be left is too short to stay hidden.
+            if n > k + diff::MIN_HIDDEN {
+                let (s, e) = (lines.start, lines.end);
+                add(
+                    &shows,
+                    &format!("Show First {k} Lines"),
+                    Box::new(move |t| t.reveal(s..s + k)),
+                );
+                add(
+                    &shows,
+                    &format!("Show Last {k} Lines"),
+                    Box::new(move |t| t.reveal(e - k..e)),
+                );
+            }
+        }
+        menu.append_section(None, &shows);
+        if lines != gap.region {
+            let hides = gio::Menu::new();
+            let region = gap.region.clone();
+            add(
+                &hides,
+                &format!("Hide {} Unchanged Lines", region.len()),
+                Box::new(move |t| t.unreveal(&region)),
+            );
+            menu.append_section(None, &hides);
+        }
+
+        body.insert_action_group("gap", Some(&group));
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(body);
+        popover.set_has_arrow(false);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| {
+            // Not right away: the chosen item is activated after the menu closes.
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
     }
 
     fn update_toggle_label(&self) {
@@ -564,7 +703,14 @@ impl FileView {
             lh => lh,
         };
         let notes = self.notes();
-        let layout = diff::layout(&self.blocks, &notes, self.collapsed.get(), lh, GAP_HEIGHT);
+        let layout = diff::layout(
+            &self.blocks,
+            &notes,
+            self.collapsed.get(),
+            &self.revealed.borrow(),
+            lh,
+            GAP_HEIGHT,
+        );
         for ((card, _), y) in self.cards.borrow().iter().zip(&layout.notes) {
             card.widget.set_visible(y.is_some());
         }
@@ -792,6 +938,16 @@ impl FileView {
             }
         });
         group.add_action(&action);
+        let action = gio::SimpleAction::new("hide-unchanged", None);
+        let weak = self.weak_self.clone();
+        action.connect_activate(move |_, _| {
+            if let Some(this) = weak.upgrade()
+                && let Some(region) = this.menu_region.take()
+            {
+                this.unreveal(&region);
+            }
+        });
+        group.add_action(&action);
         side.view.insert_action_group("side", Some(&group));
         let menu = gio::Menu::new();
         menu.append(Some("Add Comment (C)"), Some("side.comment"));
@@ -816,14 +972,21 @@ impl FileView {
         });
         side.view.add_controller(keys);
 
-        // A right click outside the selection comments on the clicked line.
+        // A right click outside the selection comments on the clicked line. On a revealed
+        // unchanged line, the menu also offers to hide its region again.
         let click = gtk::GestureClick::builder()
             .button(gdk::BUTTON_SECONDARY)
             .build();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let view = side.view.downgrade();
+        let weak = self.weak_self.clone();
         click.connect_pressed(move |_, _, x, y| {
-            let Some(view) = view.upgrade() else { return };
+            if menu.n_items() > 1 {
+                menu.remove(1);
+            }
+            let (Some(view), Some(this)) = (view.upgrade(), weak.upgrade()) else {
+                return;
+            };
             let (bx, by) =
                 view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
             let Some(iter) = view.iter_at_location(bx, by) else {
@@ -836,6 +999,15 @@ impl FileView {
             if !inside {
                 buffer.place_cursor(&iter);
             }
+            let line = iter.line() as usize;
+            let layout = this.layout.borrow();
+            let region = layout.revealed.iter().find(|r| r[i].contains(&line));
+            if let Some(region) = region {
+                let n = region[i].len();
+                let label = format!("Hide {n} Unchanged Line{}", if n == 1 { "" } else { "s" });
+                menu.append(Some(&label), Some("side.hide-unchanged"));
+            }
+            *this.menu_region.borrow_mut() = region.map(|r| r[0].clone());
         });
         side.view.add_controller(click);
     }
