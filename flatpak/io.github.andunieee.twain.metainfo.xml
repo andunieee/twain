@@ -4,6 +4,10 @@
   <name>Twain</name>
   <summary>A GTK4 diff viewer for git repositories</summary>
   <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.andunieee">
+    <name>andunie</name>
+  </developer>
   <description>
     <p>
       Twain is a diff viewer for git repositories. Like meld, but it shows
@@ -19,12 +23,21 @@
   </description>
   <url type="homepage">https://andunieee.github.io/twain/</url>
   <url type="bugtracker">https://github.com/andunieee/twain/issues</url>
+  <url type="vcs-browser">https://github.com/andunieee/twain</url>
   <screenshots>
     <screenshot type="default">
       <image>https://raw.githubusercontent.com/andunieee/twain/v0.1.0/screenshot.png</image>
       <caption>Every changed file side by side in one scrolling view</caption>
     </screenshot>
   </screenshots>
+  <content_rating type="oars-1.1"/>
+  <branding>
+    <color type="primary" scheme_preference="light">#f2c9cb</color>
+    <color type="primary" scheme_preference="dark">#5a1d21</color>
+  </branding>
+  <releases>
+    <release version="0.1.0" date="2026-10-14"/>
+  </releases>
   <launchable type="desktop-id">io.github.andunieee.twain.desktop</launchable>
   <provides>
     <binary>twain</binary>

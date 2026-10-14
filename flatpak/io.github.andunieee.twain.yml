@@ -1,4 +1,4 @@
-app-id: io.github.andunieee.twain
+id: io.github.andunieee.twain
 runtime: org.gnome.Platform
 runtime-version: '49'
 sdk: org.gnome.Sdk
@@ -11,8 +11,11 @@ finish-args:
   - --socket=fallback-x11
   - --socket=wayland
   - --device=dri
-  # diff viewer must read arbitrary git checkouts on the host
-  - --filesystem=host
+  # Diff viewer must read arbitrary git checkouts, but never changes them.
+  - --filesystem=home:ro
+  # Review comments live in the host's data dir, shared with a twain
+  # installed outside Flatpak (see src/comments.rs).
+  - --filesystem=xdg-data/twain:create
 modules:
   # The app shells out to `git`, which is not in the GNOME runtime,
   # so bundle it.
@@ -40,9 +43,11 @@ modules:
       - install -Dm644 flatpak/io.github.andunieee.twain.metainfo.xml /app/share/metainfo/io.github.andunieee.twain.metainfo.xml
       - install -Dm644 flatpak/io.github.andunieee.twain.svg /app/share/icons/hicolor/scalable/apps/io.github.andunieee.twain.svg
     sources:
+      # Builds the working tree, for local and CI builds. The manifest
+      # submitted to Flathub uses a git source pinned to a release tag.
       - type: dir
         path: ..
-      # Generated from Cargo.lock by the release workflow (not committed).
-      # This entry expands to the vendored crate sources flatpak-builder
-      # fetches up front, so the build itself needs no network.
+      # Generated from Cargo.lock with flatpak-cargo-generator.py (CI checks
+      # it is up to date). It expands to the vendored crate sources
+      # flatpak-builder fetches up front, so the build needs no network.
       - cargo-sources.json

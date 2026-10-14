@@ -64,18 +64,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate flatpak/cargo-sources.json from Cargo.lock
+      - name: Check flatpak/cargo-sources.json matches Cargo.lock
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install aiohttp tomlkit
           curl -sSL -o "$RUNNER_TEMP/fcg.py" \
             https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
           "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/fcg.py" Cargo.lock -o flatpak/cargo-sources.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cargo-sources
-          path: flatpak/cargo-sources.json
+          git diff --exit-code flatpak/cargo-sources.json || {
+            echo "::error::flatpak/cargo-sources.json is stale; regenerate it from Cargo.lock"
+            exit 1
+          }
 
   flatpak:
     name: flatpak (linux/${{ matrix.arch }})
@@ -94,11 +93,6 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: cargo-sources
-          path: flatpak
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
