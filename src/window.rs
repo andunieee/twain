@@ -14,6 +14,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib, graphene};
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 struct Match {
@@ -35,7 +36,10 @@ pub struct Window {
     tree_view: gtk::ListView,
     /// Paths and statuses of the changed files, in file order, and the unchanged files.
     tree_paths: RefCell<(Vec<(String, char)>, Vec<String>)>,
-    show_unchanged: Cell<bool>,
+    /// Directories whose unchanged files are shown, by full path ("" for the top level).
+    unchanged_shown: RefCell<HashSet<String>>,
+    /// The top level's row above the tree, for showing its unchanged files.
+    root_row: gtk::Box,
     /// The old (left) and new (right) column.
     scrollers: [gtk::ScrolledWindow; 2],
     contents: [gtk::Box; 2],
@@ -91,6 +95,36 @@ fn node_of(row: &glib::Object) -> Option<Rc<Node>> {
     Some(node)
 }
 
+/// The "(+)" / "(-)" after a directory's name that shows or hides its unchanged files.
+fn unchanged_toggle() -> gtk::Label {
+    let toggle = gtk::Label::builder()
+        .css_classes(["dim-label", "unchanged-toggle"])
+        .cursor(&gdk::Cursor::from_name("pointer", None).unwrap())
+        .build();
+    let click = gtk::GestureClick::new();
+    // Claim the click so it doesn't also expand or collapse the row.
+    click.connect_pressed(|g, _, _, _| {
+        g.set_state(gtk::EventSequenceState::Claimed);
+    });
+    toggle.add_controller(click);
+    toggle
+}
+
+fn gesture_of(toggle: &impl IsA<gtk::Widget>) -> gtk::GestureClick {
+    toggle.observe_controllers().item(0).and_downcast().unwrap()
+}
+
+fn set_unchanged_toggle(toggle: &gtk::Label, shown: Option<bool>) {
+    toggle.set_visible(shown.is_some());
+    let shown = shown.unwrap_or(false);
+    toggle.set_label(if shown { "(-)" } else { "(+)" });
+    toggle.set_tooltip_text(Some(if shown {
+        "Hide unchanged files"
+    } else {
+        "Show unchanged files"
+    }));
+}
+
 impl Window {
     pub fn new(app: &adw::Application, opts: Options) -> Rc<Window> {
         let title = adw::WindowTitle::new("Twain", "");
@@ -104,18 +138,6 @@ impl Window {
             .cursor(&pointer)
             .build();
         header.pack_end(&search_button);
-
-        let menu = gio::Menu::new();
-        menu.append(Some("Show All Files in Full"), Some("win.expand-all"));
-        menu.append(Some("Show Only Changes"), Some("win.collapse-all"));
-        menu.append(Some("Show Unchanged Files"), Some("win.show-unchanged"));
-        menu.append(Some("Reload"), Some("win.reload"));
-        let menu_button = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
-            .menu_model(&menu)
-            .cursor(&pointer)
-            .build();
-        header.pack_end(&menu_button);
 
         let reload_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -184,11 +206,31 @@ impl Window {
         let factory = gtk::SignalListItemFactory::new();
         let tree_view = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
         tree_view.add_css_class("navigation-sidebar");
-        let sidebar = gtk::ScrolledWindow::builder()
+        let root_row = gtk::Box::builder()
+            .spacing(6)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        root_row.append(&gtk::Image::from_icon_name("folder-symbolic"));
+        root_row.append(
+            &gtk::Label::builder()
+                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                .build(),
+        );
+        root_row.append(&unchanged_toggle());
+        let tree_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&tree_view)
+            .vexpand(true)
+            .build();
+        let sidebar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
             .width_request(180)
             .build();
+        sidebar.append(&root_row);
+        sidebar.append(&tree_scroller);
 
         // Diff content
         let contents = [(); 2].map(|_| {
@@ -285,7 +327,8 @@ impl Window {
             selection,
             tree_view,
             tree_paths: RefCell::default(),
-            show_unchanged: Cell::new(false),
+            unchanged_shown: RefCell::default(),
+            root_row,
             scrollers,
             contents,
             linkmap,
@@ -323,6 +366,21 @@ impl Window {
 
     fn setup_tree_factory(self: &Rc<Self>, factory: &gtk::SignalListItemFactory) {
         let weak = Rc::downgrade(self);
+        let toggle = self.root_row.last_child().unwrap();
+        gesture_of(&toggle).connect_released(move |_, _, _, _| {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            let shown = this.unchanged_shown.borrow().contains("");
+            if shown {
+                this.unchanged_shown.borrow_mut().clear();
+            } else {
+                this.unchanged_shown.borrow_mut().insert(String::new());
+            }
+            this.fill_tree();
+        });
+
+        let weak = Rc::downgrade(self);
         factory.connect_setup(move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
             let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -331,17 +389,24 @@ impl Window {
             hbox.append(
                 &gtk::Label::builder()
                     .xalign(0.0)
-                    .hexpand(true)
                     .ellipsize(gtk::pango::EllipsizeMode::Middle)
                     .build(),
             );
-            hbox.append(&gtk::Label::new(None));
+            let toggle = unchanged_toggle();
+            hbox.append(&toggle);
+            hbox.append(
+                &gtk::Label::builder()
+                    .hexpand(true)
+                    .halign(gtk::Align::End)
+                    .build(),
+            );
             let expander = gtk::TreeExpander::builder().child(&hbox).build();
             item.set_child(Some(&expander));
 
             // Click a file to jump to it, double click to show it in full.
             let click = gtk::GestureClick::new();
             let (weak, item) = (weak.clone(), item.downgrade());
+            let (toggle_weak, toggle_item) = (weak.clone(), item.clone());
             click.connect_released(move |_, n_press, _, _| {
                 let (Some(this), Some(item)) = (weak.upgrade(), item.upgrade()) else {
                     return;
@@ -360,6 +425,17 @@ impl Window {
                 }
             });
             hbox.add_controller(click);
+
+            let click = gesture_of(&toggle);
+            click.connect_released(move |_, _, _, _| {
+                let (Some(this), Some(item)) = (toggle_weak.upgrade(), toggle_item.upgrade())
+                else {
+                    return;
+                };
+                if let Some(node) = item.item().and_then(|row| node_of(&row)) {
+                    this.toggle_unchanged(&node);
+                }
+            });
         });
         factory.connect_bind(|_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -372,7 +448,9 @@ impl Window {
             let hbox = expander.child().unwrap();
             let icon = hbox.first_child().and_downcast::<gtk::Image>().unwrap();
             let label = icon.next_sibling().and_downcast::<gtk::Label>().unwrap();
-            let status = label.next_sibling().and_downcast::<gtk::Label>().unwrap();
+            let toggle = label.next_sibling().and_downcast::<gtk::Label>().unwrap();
+            let status = toggle.next_sibling().and_downcast::<gtk::Label>().unwrap();
+            set_unchanged_toggle(&toggle, node.unchanged_shown);
             label.set_label(&node.name);
             label.set_tooltip_text(Some(&node.name));
             // Unchanged files (and directories without changes) are dimmed and inert.
@@ -636,20 +714,6 @@ impl Window {
         add("find-next", |this| this.step_search(true));
         add("find-prev", |this| this.step_search(false));
         add("reload", |this| this.load());
-        add("expand-all", |this| this.set_all_collapsed(false));
-        add("collapse-all", |this| this.set_all_collapsed(true));
-
-        let action = gio::SimpleAction::new_stateful("show-unchanged", None, &false.to_variant());
-        let weak = Rc::downgrade(self);
-        action.connect_change_state(move |action, state| {
-            let (Some(this), Some(state)) = (weak.upgrade(), state) else {
-                return;
-            };
-            action.set_state(state);
-            this.show_unchanged.set(state.get().unwrap_or(false));
-            this.fill_tree();
-        });
-        self.window.add_action(&action);
     }
 
     pub fn load(self: &Rc<Self>) {
@@ -728,7 +792,7 @@ impl Window {
                 .iter()
                 .map(|f| (f.path.as_str(), f.status))
                 .collect();
-            tree::file_order(&tree::build(&paths, &[]))
+            tree::file_order(&tree::build(&paths, &[], &HashSet::new()).children)
         };
         let mut slots: Vec<_> = changes.drain(..).map(Some).collect();
         let changes: Vec<git::FileChange> =
@@ -786,36 +850,97 @@ impl Window {
         });
     }
 
-    /// (Re)builds the sidebar tree, with the unchanged files if they're shown. Directories
-    /// with changes start out expanded, the others collapsed.
+    /// (Re)builds the sidebar tree, with the unchanged files of the directories they're shown
+    /// in. Directories keep whether they're expanded; new ones start out expanded if they have
+    /// changes or shown unchanged files.
     fn fill_tree(&self) {
+        let mut expanded = HashMap::new();
+        let mut pos = 0;
+        while let Some(row) = self.tree_model.item(pos) {
+            let row = row.downcast::<gtk::TreeListRow>().unwrap();
+            if let Some(n) = node_of(row.upcast_ref()).filter(|n| n.dir) {
+                expanded.insert(n.chain.last().unwrap().clone(), row.is_expanded());
+            }
+            pos += 1;
+        }
+        let adj = self.tree_view.vadjustment().unwrap();
+        let scroll = adj.value();
+
         let paths = self.tree_paths.borrow();
         let changed: Vec<_> = paths.0.iter().map(|(p, s)| (p.as_str(), *s)).collect();
-        let unchanged: Vec<_> = if self.show_unchanged.get() {
-            paths.1.iter().map(String::as_str).collect()
-        } else {
-            Vec::new()
-        };
+        let unchanged: Vec<_> = paths.1.iter().map(String::as_str).collect();
+        let root = tree::build(&changed, &unchanged, &self.unchanged_shown.borrow());
+        let label = self.root_row.first_child().unwrap().next_sibling().unwrap();
+        let name = std::path::Path::new(&*self.shared.root.borrow())
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        label.downcast_ref::<gtk::Label>().unwrap().set_label(&name);
+        let toggle = label.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        set_unchanged_toggle(&toggle, root.unchanged_shown);
+        self.root_row.set_visible(root.unchanged_shown.is_some());
+
         self.tree_store.remove_all();
-        for node in tree::build(&changed, &unchanged) {
+        for node in root.children {
             self.tree_store.append(&glib::BoxedAnyObject::new(node));
         }
         // Expanding a row inserts its children right after it, so they're visited too.
         let mut pos = 0;
         while let Some(row) = self.tree_model.item(pos) {
-            if node_of(&row).is_some_and(|n| n.dir && n.changed) {
-                row.downcast::<gtk::TreeListRow>().unwrap().set_expanded(true);
+            if let Some(n) = node_of(&row).filter(|n| n.dir) {
+                let path = n.chain.last().unwrap();
+                let expand = expanded
+                    .get(path)
+                    .copied()
+                    .unwrap_or(n.changed || n.unchanged_shown == Some(true));
+                row.downcast::<gtk::TreeListRow>().unwrap().set_expanded(expand);
             }
             pos += 1;
         }
+        drop(paths);
+        let weak = self.tree_view.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(adj) = weak.upgrade().and_then(|v| v.vadjustment()) {
+                adj.set_value(scroll);
+            }
+        });
         self.synced_file.set(None);
         self.sync_sidebar();
     }
 
-    fn set_all_collapsed(&self, collapsed: bool) {
-        for f in self.files.borrow().iter() {
-            f.set_collapsed(collapsed);
+    /// Shows or hides the unchanged files of a directory. Showing them shows those of all
+    /// the directories merged into its row, and expands it; hiding them also hides those of
+    /// the directories inside.
+    fn toggle_unchanged(&self, node: &Node) {
+        let Some(shown) = node.unchanged_shown else {
+            return;
+        };
+        {
+            let mut set = self.unchanged_shown.borrow_mut();
+            if shown {
+                let first = &node.chain[0];
+                let prefix = format!("{first}/");
+                set.retain(|p| p != first && (first.is_empty() || !p.starts_with(&prefix)));
+            } else {
+                set.extend(node.chain.iter().cloned());
+            }
         }
+        if !shown && let Some(row) = self.find_row(node.chain.last().unwrap()) {
+            row.set_expanded(true);
+        }
+        self.fill_tree();
+    }
+
+    /// The tree row of a directory, by full path.
+    fn find_row(&self, path: &str) -> Option<gtk::TreeListRow> {
+        let mut pos = 0;
+        while let Some(row) = self.tree_model.item(pos) {
+            if node_of(&row).is_some_and(|n| n.dir && n.chain.last().unwrap() == path) {
+                return row.downcast().ok();
+            }
+            pos += 1;
+        }
+        None
     }
 
     /// y of the top of a file in a column.
