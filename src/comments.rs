@@ -1,31 +1,29 @@
 //! Comments on lines of files, shared between every twain process.
 //!
-//! Comments live in one LMDB environment (`$XDG_DATA_HOME/twain/comments`, the host's one
+//! Comments live in one SQLite database (`$XDG_DATA_HOME/twain/comments.db`, the host's one
 //! also from Flatpak) that all twain processes — windows and `twain comment` invocations —
-//! keep open at the same time. Keys are
+//! keep open at the same time, one row per comment keyed by repository root, repo-relative
+//! path and id, with the comment as JSON. Its locks are byte-range locks on the database
+//! files, which unlike LMDB's pid-keyed reader table work across Flatpak's pid namespaces.
+//!
+//! After committing a write, a process sends the key it wrote,
 //!
 //! ```text
 //! <repo root> \0 <repo-relative path> \0 <id>
 //! ```
 //!
-//! so a repository's comments, or one file's, are a prefix scan away. Values are JSON.
-//!
-//! After committing a write, a process sends the key it wrote as a datagram to every socket in
+//! as a datagram to every socket in
 //! `$XDG_DATA_HOME/twain/processes/` (each listening process binds one with a random name;
 //! not the pid, since every Flatpak sandbox has its own pid namespace and they all collide),
 //! and the receivers decide from the key whether they need to requery. Sockets left behind by
 //! dead processes are removed by the first sender that gets refused.
 
-use heed::types::Bytes;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::Range;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
-/// LMDB's default limit on key size.
-const MAX_KEY: usize = 511;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -247,26 +245,15 @@ impl Key {
     }
 }
 
-fn prefix(root: &str, path: Option<&str>) -> Vec<u8> {
-    let mut p = root.as_bytes().to_vec();
-    p.push(0);
-    if let Some(path) = path {
-        p.extend_from_slice(path.as_bytes());
-        p.push(0);
-    }
-    p
-}
-
 pub struct Store {
-    env: heed::Env,
-    db: heed::Database<Bytes, Bytes>,
+    conn: Mutex<rusqlite::Connection>,
 }
 
-fn db_err(e: heed::Error) -> String {
+fn db_err(e: rusqlite::Error) -> String {
     format!("comment database: {e}")
 }
 
-/// The process-wide store. LMDB environments must only be opened once per process.
+/// The process-wide store.
 pub fn store() -> Result<&'static Store, String> {
     static STORE: OnceLock<Result<Store, String>> = OnceLock::new();
     STORE
@@ -277,34 +264,47 @@ pub fn store() -> Result<&'static Store, String> {
 
 impl Store {
     fn open() -> Result<Store, String> {
-        let dir = data_dir().join("comments");
+        let dir = data_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        // SAFETY: the environment is opened once per process (see `store`), and the files are
-        // only ever opened by LMDB itself.
-        let env = unsafe {
-            heed::EnvOpenOptions::new()
-                .map_size(1 << 30)
-                .max_dbs(1)
-                .open(&dir)
-        }
+        let conn = rusqlite::Connection::open(dir.join("comments.db")).map_err(db_err)?;
+        // Writers wait for each other instead of failing.
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(db_err)?;
+        conn.pragma_update(None, "journal_mode", "wal")
+            .map_err(db_err)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS comments (
+                root TEXT NOT NULL,
+                path TEXT NOT NULL,
+                id TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                PRIMARY KEY (root, path, id)
+            ) WITHOUT ROWID",
+        )
         .map_err(db_err)?;
-        let mut wtxn = env.write_txn().map_err(db_err)?;
-        let db = env.create_database(&mut wtxn, None).map_err(db_err)?;
-        wtxn.commit().map_err(db_err)?;
-        Ok(Store { env, db })
+        Ok(Store {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Comments of a repository, or of one file in it, ordered by file, then line.
     pub fn list(&self, root: &str, path: Option<&str>) -> Result<Vec<Comment>, String> {
-        let rtxn = self.env.read_txn().map_err(db_err)?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT comment FROM comments WHERE root = ?1 AND (?2 IS NULL OR path = ?2)",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map((root, path), |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
         let mut out = Vec::new();
-        for entry in self
-            .db
-            .prefix_iter(&rtxn, &prefix(root, path))
-            .map_err(db_err)?
-        {
-            let (_, value) = entry.map_err(db_err)?;
-            match serde_json::from_slice::<Comment>(value) {
+        for value in rows {
+            match serde_json::from_str::<Comment>(&value.map_err(db_err)?) {
                 Ok(c) => out.push(c),
                 Err(e) => eprintln!("twain: skipping unreadable comment: {e}"),
             }
@@ -316,12 +316,17 @@ impl Store {
     }
 
     pub fn get(&self, root: &str, path: &str, id: &str) -> Result<Option<Comment>, String> {
-        let rtxn = self.env.read_txn().map_err(db_err)?;
-        let value = self
-            .db
-            .get(&rtxn, &Key::encode(root, path, id))
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT comment FROM comments WHERE root = ?1 AND path = ?2 AND id = ?3",
+                (root, path, id),
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(db_err)?;
-        Ok(value.and_then(|v| serde_json::from_slice(v).ok()))
+        Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
     }
 
     /// Finds a comment of the repository by id, or by an unambiguous id prefix.
@@ -344,45 +349,61 @@ impl Store {
     /// Inserts or replaces comments, giving a fresh id to those without one, and notifies the
     /// other processes.
     pub fn put(&self, root: &str, comments: &mut [Comment]) -> Result<(), String> {
-        let mut wtxn = self.env.write_txn().map_err(db_err)?;
+        let mut conn = self.conn();
+        // IMMEDIATE takes the write lock up front, so the id check below can't race.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
         let mut keys = Vec::new();
         for comment in comments.iter_mut() {
             if comment.id.is_empty() {
                 comment.id = loop {
                     let id = new_id();
-                    let key = Key::encode(root, &comment.path, &id);
-                    if self.db.get(&wtxn, &key).map_err(db_err)?.is_none() {
+                    let taken: bool = tx
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM comments
+                             WHERE root = ?1 AND path = ?2 AND id = ?3)",
+                            (root, &comment.path, &id),
+                            |row| row.get(0),
+                        )
+                        .map_err(db_err)?;
+                    if !taken {
                         break id;
                     }
                 };
             }
-            let key = Key::encode(root, &comment.path, &comment.id);
-            if key.len() > MAX_KEY {
-                return Err(format!(
-                    "path too long to store comments for: {}",
-                    comment.path
-                ));
-            }
-            let value = serde_json::to_vec(comment).map_err(|e| e.to_string())?;
-            self.db.put(&mut wtxn, &key, &value).map_err(db_err)?;
-            keys.push(key);
+            let value = serde_json::to_string(comment).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO comments (root, path, id, comment) VALUES (?1, ?2, ?3, ?4)",
+                (root, &comment.path, &comment.id, &value),
+            )
+            .map_err(db_err)?;
+            keys.push(Key::encode(root, &comment.path, &comment.id));
         }
-        wtxn.commit().map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        drop(conn);
         notify(&keys);
         Ok(())
     }
 
     /// Deletes comments and notifies the other processes.
     pub fn delete(&self, root: &str, comments: &[Comment]) -> Result<(), String> {
-        let mut wtxn = self.env.write_txn().map_err(db_err)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db_err)?;
         let mut keys = Vec::new();
         for c in comments {
-            let key = Key::encode(root, &c.path, &c.id);
-            if self.db.delete(&mut wtxn, &key).map_err(db_err)? {
-                keys.push(key);
+            let n = tx
+                .execute(
+                    "DELETE FROM comments WHERE root = ?1 AND path = ?2 AND id = ?3",
+                    (root, &c.path, &c.id),
+                )
+                .map_err(db_err)?;
+            if n > 0 {
+                keys.push(Key::encode(root, &c.path, &c.id));
             }
         }
-        wtxn.commit().map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        drop(conn);
         notify(&keys);
         Ok(())
     }
@@ -526,9 +547,6 @@ mod tests {
             (d.root.as_str(), d.path.as_str(), d.id.as_str()),
             ("/repo", "src/a b.rs", "0123abcd")
         );
-        assert!(k.starts_with(&prefix("/repo", Some("src/a b.rs"))));
-        assert!(!k.starts_with(&prefix("/repo", Some("src/a"))));
-        assert!(!Key::encode("/repo2", "x", "y").starts_with(&prefix("/repo", None)));
     }
 
     #[test]

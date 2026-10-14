@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
-heed = { version = "0.22", default-features = false }
 pangocairo = "0.22"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 similar = "2.7"
