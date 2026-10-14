@@ -1,0 +1,41 @@
+name: pages
+
+on:
+  push:
+    branches: [master]
+    paths: [README.md, screenshot.png, .github/workflows/pages.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render README.md into a page
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          mkdir _site
+          cp screenshot.png flatpak/io.github.andunieee.twain.svg _site/
+          pandoc README.md --standalone --metadata pagetitle=twain \
+            --variable 'header-includes=<link rel="icon" href="io.github.andunieee.twain.svg">' \
+            --variable 'header-includes=<style>body{max-width:52em} img{border-radius:8px}</style>' \
+            -o _site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,82 +1,33 @@
 # twain
 
-A GTK4 diff viewer for git repositories. Like meld, but shows every changed file in one
+A diff viewer for git repositories. Like meld, but every changed file is shown in one
 scrolling sequence instead of one tab per file.
 
-- Side-by-side diffs like meld: old and new files each flow normally in their own column with
-  its own scrollbar, kept in sync as you scroll, with curved links between changed chunks and
-  intra-line highlights
-- Only changed regions are shown (3 lines of context); click a file header to see the full file
-- Syntax highlighting (tree-sitter for common languages, GtkSourceView for the rest) and real
-  line numbers
-- File tree sidebar: click to jump to a file, double-click to show it in full
-  (menu → Show Unchanged Files adds the rest of the repository, dimmed)
-- Ctrl+F search across the whole diff
+![twain showing a diff](screenshot.png)
 
 ## Usage
 
-```
-twain                 HEAD vs working tree (staged + unstaged + untracked)
-twain --staged        HEAD vs index
-twain <rev>           <rev> vs working tree
-twain <a> <b>         <a> vs <b>   (also <a>..<b> and <a>...<b>)
-twain -C <dir> ...    run in another repository
-```
-
-| Key                         | Action                 |
-| --------------------------- | ---------------------- |
-| Ctrl+F                      | Search                 |
-| Enter / Ctrl+G / F3         | Next match             |
-| Shift+Enter / Ctrl+Shift+G  | Previous match         |
-| F5 / Ctrl+R                 | Reload                 |
-| Ctrl+W / Ctrl+Q             | Close                  |
+Run `twain` inside your project and it shows all your pending changes: staged, unstaged and
+untracked. It can also compare revisions (`twain main`, `twain v1.0 v1.1`) or just what's
+staged (`twain --staged`); see `twain --help`.
 
 ## Comments
 
-Select one or more lines in either side and press `C` (or right-click → Add Comment) to
-comment on them; Ctrl+Enter saves. Comments can be edited, resolved and deleted from their
-card, and follow their lines as the file changes (or are marked *outdated* when the lines
-are gone).
+Select lines and press `C` to leave a comment on them. Comments can also be listed, added
+and answered from outside the app with `twain comment`, so scripts and coding agents can
+take part in the review, and open windows update immediately. See `twain comment --help`.
 
-Comments are stored in an LMDB database in `~/.local/share/twain/comments`, shared by every
-twain process, so agents and scripts can read and write them with `twain comment`, and open
-windows update immediately:
+## Install
 
-```
-twain comment list [--file <path>] [--unresolved] [--json]
-twain comment add --file src/main.rs --line 10-14 -m "Why not use a BTreeMap here?"
-twain comment edit <id> -m <text>          twain comment resolve|unresolve <id>...
-twain comment rm <id>...                   twain comment clear [--file <path>]
-twain comment watch [--once] [--not-author agent] [--timeout <secs>] [--json]
-```
-
-Line numbers are 1-based and refer to the working tree file unless `--old` is given. `watch`
-blocks until comments change, so an agent can wait for a reply from the person reviewing:
-`twain comment watch --once --not-author agent`. See `twain comment --help`.
-
-Keys are `<repo root>\0<path>\0<id>`; each process listening for changes binds a datagram
-socket at `~/.local/share/twain/processes/<pid>`, and writers send the keys they write to
-all of them.
-
-## Building
-
-Needs GTK ≥ 4.12, GtkSourceView 5 and libadwaita ≥ 1.6 (on Arch:
-`pacman -S gtk4 gtksourceview5 libadwaita`; on Debian/Ubuntu:
-`apt install libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev`).
-
-```
-cargo install --path .
-```
-
-## Releases
-
-Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`, which
-builds a single binary per Linux arch (`twain-<version>-linux-<arch>.tar.gz`,
-needs the GTK system libs above to run) and a Flatpak bundle
-(`twain-linux-<arch>.flatpak`, runs anywhere), then attaches all of them to
-a GitHub release:
+Download the Flatpak bundle from the [latest release](https://github.com/andunieee/twain/releases/latest)
+and run:
 
 ```
 flatpak install twain-linux-x86_64.flatpak
-flatpak run io.github.andunieee.twain
+```
+
+Or build from source (needs GTK 4, GtkSourceView 5 and libadwaita):
+
+```
+cargo install --git https://github.com/andunieee/twain
 ```

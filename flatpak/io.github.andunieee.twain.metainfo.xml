@@ -17,6 +17,13 @@
       lines can carry review comments.
     </p>
   </description>
+  <url type="homepage">https://andunieee.github.io/twain/</url>
+  <url type="bugtracker">https://github.com/andunieee/twain/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://andunieee.github.io/twain/screenshot.png</image>
+    </screenshot>
+  </screenshots>
   <launchable type="desktop-id">io.github.andunieee.twain.desktop</launchable>
   <provides>
     <binary>twain</binary>
