@@ -233,10 +233,7 @@ impl Half {
         let body = gtk::Overlay::new();
         let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         match message {
-            None => {
-                header.set_tooltip_text(Some("Toggle between changes only and the full file"));
-                body.set_child(Some(&placeholder));
-            }
+            None => body.set_child(Some(&placeholder)),
             Some(msg) => {
                 toggle_label.set_visible(false);
                 let l = gtk::Label::new(Some(msg));
@@ -355,7 +352,10 @@ impl FileView {
                 this.setup_gap_input(side);
                 let weak = Rc::downgrade(&this);
                 half.header().connect_clicked(move |_| {
-                    if let Some(this) = weak.upgrade() {
+                    // Only while there is something to toggle.
+                    if let Some(this) = weak.upgrade()
+                        && this.halves[0].toggle_label.is_visible()
+                    {
                         this.set_collapsed(!this.collapsed.get());
                     }
                 });
@@ -715,6 +715,20 @@ impl FileView {
             lh,
             GAP_HEIGHT,
         );
+        // Whether showing only the changes hides anything; if not, there's nothing to toggle.
+        let can_hide = if self.collapsed.get() {
+            !layout.gaps.is_empty() || !layout.revealed.is_empty()
+        } else {
+            !diff::layout(&self.blocks, &notes, true, &[], lh, GAP_HEIGHT)
+                .gaps
+                .is_empty()
+        };
+        for half in &self.halves {
+            half.toggle_label.set_visible(can_hide);
+            half.header().set_tooltip_text(
+                can_hide.then_some("Toggle between changes only and the full file"),
+            );
+        }
         for ((card, _), y) in self.cards.borrow().iter().zip(&layout.notes) {
             card.widget.set_visible(y.is_some());
         }
