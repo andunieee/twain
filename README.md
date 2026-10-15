@@ -1,32 +1,45 @@
 # twain
 
-A diff viewer for git repositories. Like meld, but every changed file is shown in one
-scrolling sequence instead of one tab per file.
+A diff viewer for people who love Meld, but wanted it to be slightly different.
 
 ![twain showing a diff](screenshot.png)
 
+Things that are like Meld:
+
+  - intuitive and nice view of what changed to what, what was removed from where and added where;
+  - scrolling minimaps of changes;
+  - git support;
+  - fast.
+
+Things we have that Meld doesn't:
+
+  - all files from a Git diff shown in the same view, sequentially;
+  - a file tree on the side, super fast;
+  - show either the full files or only the parts that changed, with granular revealing of the unchanged parts;
+  - tree-sitter-based syntax highlighting;
+  - the ability to comment on sets of changes and lines, and AIs can read these comments and add more from a CLI, like Hunk;
+  - the ability to search through the entire set of modified files.
+
+Thins Meld has that we don't:
+
+  - merge;
+  - three-way comparisons;
+  - support for other version control systems;
+  - ability to edit the files directly.
+
 ## Usage
 
-Run `twain` inside your project and it shows all your pending changes: staged, unstaged and
-untracked. It can also compare revisions (`twain main`, `twain v1.0 v1.1`) or just what's
-staged (`twain --staged`); see `twain --help`.
+Run `twain` in your project's directory. It can also compare other Git revisions, but that doesn't matter much for now.
 
 ## Comments
 
-Select lines and press `C` to leave a comment on them. Comments can also be listed, added
-and answered from outside the app with `twain comment`, so scripts and coding agents can
-take part in the review, and open windows update immediately. See `twain comment --help`.
+Select lines and press `C` or right-click the mouse to leave a comment on them.
+
+Tell your AI agent to look into `twain comment --help` so it can participate.
 
 ## Install
 
-Download the Flatpak bundle from the [latest release](https://github.com/andunieee/twain/releases/latest)
-and run:
-
-```
-flatpak install twain-linux-x86_64.flatpak
-```
-
-Or build from source (needs GTK 4, GtkSourceView 5 and libadwaita):
+Download a binary or a Flatpak bundle from the [latest release](https://github.com/andunieee/twain/releases/latest) or build from source (needs GTK 4, GtkSourceView 5 and libadwaita):
 
 ```
 cargo install --git https://github.com/andunieee/twain
