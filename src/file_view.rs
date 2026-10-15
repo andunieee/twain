@@ -1026,9 +1026,6 @@ impl FileView {
         });
         group.add_action(&action);
         side.view.insert_action_group("side", Some(&group));
-        let menu = gio::Menu::new();
-        menu.append(Some("Add Comment (C)"), Some("side.comment"));
-        side.view.set_extra_menu(Some(&menu));
 
         let keys = gtk::EventControllerKey::new();
         let weak = self.weak_self.clone();
@@ -1049,18 +1046,16 @@ impl FileView {
         });
         side.view.add_controller(keys);
 
-        // A right click outside the selection comments on the clicked line. On a revealed
-        // unchanged line, the menu also offers to hide its region again.
+        // Right clicks get our own menu in place of the built-in one, whose editing entries
+        // are of no use here. A right click outside the selection comments on the clicked
+        // line. On a revealed unchanged line, the menu also offers to hide its region again.
         let click = gtk::GestureClick::builder()
             .button(gdk::BUTTON_SECONDARY)
             .build();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let view = side.view.downgrade();
         let weak = self.weak_self.clone();
-        click.connect_pressed(move |_, _, x, y| {
-            if menu.n_items() > 1 {
-                menu.remove(1);
-            }
+        click.connect_pressed(move |gesture, _, x, y| {
             let (Some(view), Some(this)) = (view.upgrade(), weak.upgrade()) else {
                 return;
             };
@@ -1076,15 +1071,35 @@ impl FileView {
             if !inside {
                 buffer.place_cursor(&iter);
             }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let menu = gio::Menu::new();
+            let section = gio::Menu::new();
+            section.append(Some("Copy"), Some("clipboard.copy"));
+            section.append(Some("Select All"), Some("selection.select-all"));
+            menu.append_section(None, &section);
+            let section = gio::Menu::new();
+            section.append(Some("Add Comment (C)"), Some("side.comment"));
             let line = iter.line() as usize;
             let layout = this.layout.borrow();
             let region = layout.revealed.iter().find(|r| r[i].contains(&line));
             if let Some(region) = region {
                 let n = region[i].len();
                 let label = format!("Hide {n} Unchanged Line{}", if n == 1 { "" } else { "s" });
-                menu.append(Some(&label), Some("side.hide-unchanged"));
+                section.append(Some(&label), Some("side.hide-unchanged"));
             }
+            menu.append_section(None, &section);
             *this.menu_region.borrow_mut() = region.map(|r| r[0].clone());
+
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&view);
+            popover.set_has_arrow(false);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.connect_closed(|popover| {
+                // Not right away: the chosen item is activated after the menu closes.
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || popover.unparent());
+            });
+            popover.popup();
         });
         side.view.add_controller(click);
     }
