@@ -178,6 +178,8 @@ struct Half {
     body: gtk::Overlay,
     placeholder: gtk::Box,
     decorations: gtk::DrawingArea,
+    /// Folds the whole file down to its header.
+    fold: gtk::Image,
     toggle_label: gtk::Label,
     comment_count: gtk::Label,
     /// Width the cards were last measured for.
@@ -190,6 +192,9 @@ impl Half {
         widget.add_css_class("file-section");
 
         let header_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let fold = gtk::Image::from_icon_name("pan-down-symbolic");
+        fold.set_tooltip_text(Some("Hide file"));
+        header_box.append(&fold);
         let status = gtk::Label::new(Some(&change.status.to_string()));
         status.add_css_class("status");
         status.add_css_class(status_class(change.status));
@@ -251,6 +256,7 @@ impl Half {
             body,
             placeholder,
             decorations,
+            fold,
             toggle_label,
             comment_count,
             width: Cell::new(0),
@@ -273,6 +279,8 @@ pub struct FileView {
     search_contexts: OnceCell<[sourceview5::SearchContext; 2]>,
     blocks: Vec<Block>,
     collapsed: Cell<bool>,
+    /// Only the header is shown.
+    folded: Cell<bool>,
     /// Hidden unchanged lines (on the old side) shown anyway, while collapsed.
     revealed: RefCell<Vec<std::ops::Range<usize>>>,
     /// The region (on the old side) the text's context menu offers to hide again.
@@ -322,6 +330,7 @@ impl FileView {
             search_contexts: OnceCell::new(),
             blocks,
             collapsed: Cell::new(collapsed),
+            folded: Cell::new(false),
             revealed: RefCell::default(),
             menu_region: RefCell::default(),
             layout: RefCell::default(),
@@ -348,18 +357,29 @@ impl FileView {
             half.body.connect_get_child_position(move |_, child| {
                 weak.upgrade().and_then(|this| this.card_rect(side, child))
             });
+            // Claimed here so the header button around it doesn't see the click.
+            let click = gtk::GestureClick::new();
+            let weak = Rc::downgrade(&this);
+            click.connect_pressed(move |gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(this) = weak.upgrade() {
+                    this.set_folded(!this.folded.get());
+                }
+            });
+            half.fold.add_controller(click);
             if this.texts.is_some() {
                 this.setup_gap_input(side);
-                let weak = Rc::downgrade(&this);
-                half.header().connect_clicked(move |_| {
-                    // Only while there is something to toggle.
-                    if let Some(this) = weak.upgrade()
-                        && this.halves[0].toggle_label.is_visible()
-                    {
-                        this.set_collapsed(!this.collapsed.get());
-                    }
-                });
             }
+            let weak = Rc::downgrade(&this);
+            half.header().connect_clicked(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                if this.folded.get() {
+                    this.set_folded(false);
+                } else if this.halves[0].toggle_label.is_visible() {
+                    // Only while there is something to toggle.
+                    this.set_collapsed(!this.collapsed.get());
+                }
+            });
         }
         if this.texts.is_some() {
             this.update_toggle_label();
@@ -448,6 +468,36 @@ impl FileView {
         self.update_toggle_label();
         self.relayout();
         if let Some(f) = &*self.on_toggle.borrow() {
+            f();
+        }
+    }
+
+    pub fn is_folded(&self) -> bool {
+        self.folded.get()
+    }
+
+    /// Hides or shows everything but the header, on both sides.
+    pub fn set_folded(&self, folded: bool) {
+        if self.folded.replace(folded) == folded {
+            return;
+        }
+        for half in &self.halves {
+            half.body.set_visible(!folded);
+            half.fold.set_icon_name(Some(if folded {
+                "pan-end-symbolic"
+            } else {
+                "pan-down-symbolic"
+            }));
+            half.fold
+                .set_tooltip_text(Some(if folded { "Show file" } else { "Hide file" }));
+            half.toggle_label.set_visible(false);
+        }
+        // Puts the toggle label back, if there's something to toggle.
+        self.relayout();
+        if let Some(f) = &*self.on_toggle.borrow() {
+            f();
+        }
+        if let Some(f) = &*self.shared.on_relayout.borrow() {
             f();
         }
     }
@@ -607,7 +657,7 @@ impl FileView {
     /// Case-insensitive search through the visible lines of both sides. Works on the raw
     /// text, so it doesn't need the views to be built.
     pub fn find(&self, needle: &str) -> Vec<Hit> {
-        let Some(texts) = &self.texts else {
+        let Some(texts) = self.texts.as_ref().filter(|_| !self.folded.get()) else {
             return Vec::new();
         };
         let needle: Vec<char> = needle.chars().map(fold_case).collect();
@@ -640,8 +690,12 @@ impl FileView {
         hits
     }
 
-    /// y of the top of one side's body (where line y = 0 is) in `target`'s coordinates.
+    /// y of the top of one side's body (where line y = 0 is) in `target`'s coordinates;
+    /// `None` while folded.
     pub fn body_y(&self, side: usize, target: &impl IsA<gtk::Widget>) -> Option<f64> {
+        if self.folded.get() {
+            return None;
+        }
         self.halves[side]
             .body
             .compute_point(target, &graphene::Point::zero())
@@ -724,7 +778,7 @@ impl FileView {
                 .is_empty()
         };
         for half in &self.halves {
-            half.toggle_label.set_visible(can_hide);
+            half.toggle_label.set_visible(can_hide && !self.folded.get());
             half.header().set_tooltip_text(
                 can_hide.then_some("Toggle between changes only and the full file"),
             );
@@ -1074,7 +1128,11 @@ impl FileView {
         let fg = self.halves[0].widget.color();
         let body = [0, 1].map(|s| {
             let half = &self.halves[s];
-            tops[s] + self.body_y(s, &half.widget).unwrap_or(0.0)
+            // When folded, the header is all there is.
+            tops[s]
+                + self
+                    .body_y(s, &half.widget)
+                    .unwrap_or(half.widget.height() as f64)
         });
         cr.set_line_width(1.0);
         let band = |cr: &cairo::Context, (l0, l1): (f64, f64), (r0, r1): (f64, f64)| {
@@ -1109,7 +1167,7 @@ impl FileView {
         }
 
         let layout = self.layout.borrow();
-        if self.sides().is_none() {
+        if self.sides().is_none() || self.folded.get() {
             return;
         }
         for chunk in &layout.chunks {

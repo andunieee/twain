@@ -771,14 +771,18 @@ impl Window {
         self.current.set(None);
         self.tagged.set(None);
         self.synced_file.set(None);
-        // Keep files that were open in full open after a reload.
-        let expanded: std::collections::HashSet<String> = self
-            .files
-            .take()
-            .iter()
-            .filter(|f| !f.is_collapsed())
-            .map(|f| f.change.path.clone())
-            .collect();
+        // Keep files that were open in full open, and folded ones folded, after a reload.
+        let old_files = self.files.take();
+        let paths_where = |pred: fn(&FileView) -> bool| -> HashSet<String> {
+            old_files
+                .iter()
+                .filter(|f| pred(f))
+                .map(|f| f.change.path.clone())
+                .collect()
+        };
+        let expanded = paths_where(|f| !f.is_collapsed());
+        let folded = paths_where(|f| f.is_folded());
+        drop(old_files);
 
         if cmp.files.is_empty() {
             self.show_status("emblem-ok-symbolic", "No changes", &cmp.description);
@@ -807,8 +811,10 @@ impl Window {
         let mut eager_height = 0;
         for change in changes {
             let full = expanded.contains(&change.path);
+            let fold = folded.contains(&change.path);
             let fv = FileView::new(change, self.shared.clone(), !full);
-            if eager_height < 2000 && scroll == 0.0 {
+            fv.set_folded(fold);
+            if !fold && eager_height < 2000 && scroll == 0.0 {
                 fv.ensure_built();
                 eager_height += fv.layout.borrow().height[0] + 40;
             }
@@ -979,18 +985,19 @@ impl Window {
     fn anchors(&self) -> Vec<[f64; 2]> {
         let mut anchors = vec![[0.0, 0.0]];
         for f in self.files.borrow().iter() {
-            let (Some(l), Some(r)) = (
-                f.body_y(0, &self.contents[0]),
-                f.body_y(1, &self.contents[1]),
-            ) else {
-                continue;
-            };
             let tops = [0, 1].map(|s| {
                 f.section(s)
                     .compute_point(&self.contents[s], &graphene::Point::zero())
                     .map_or(0.0, |p| p.y() as f64)
             });
             anchors.push(tops);
+            // Folded, there's only the header.
+            let (Some(l), Some(r)) = (
+                f.body_y(0, &self.contents[0]),
+                f.body_y(1, &self.contents[1]),
+            ) else {
+                continue;
+            };
             let layout = f.layout.borrow();
             anchors.extend(
                 layout
