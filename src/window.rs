@@ -407,6 +407,7 @@ impl Window {
             let click = gtk::GestureClick::new();
             let (weak, item) = (weak.clone(), item.downgrade());
             let (toggle_weak, toggle_item) = (weak.clone(), item.clone());
+            let (menu_weak, menu_item) = (weak.clone(), item.clone());
             click.connect_released(move |_, n_press, _, _| {
                 let (Some(this), Some(item)) = (weak.upgrade(), item.upgrade()) else {
                     return;
@@ -422,6 +423,32 @@ impl Window {
                     (false, Some(i), 1) => this.scroll_to_file(i),
                     (false, Some(i), _) => this.open_file(i),
                     _ => {}
+                }
+            });
+            hbox.add_controller(click);
+
+            // Right click a file to hide it or choose how much of it to show, or a directory
+            // to do it to all the files under it.
+            let click = gtk::GestureClick::builder()
+                .button(gdk::BUTTON_SECONDARY)
+                .build();
+            click.connect_pressed(move |gesture, _, x, y| {
+                let (Some(this), Some(item)) = (menu_weak.upgrade(), menu_item.upgrade()) else {
+                    return;
+                };
+                let Some(node) = item.item().and_then(|row| node_of(&row)) else {
+                    return;
+                };
+                let files = match node.file {
+                    Some(i) => vec![i],
+                    None => tree::file_order(&node.children),
+                };
+                if files.is_empty() {
+                    return;
+                }
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(widget) = gesture.widget() {
+                    this.show_file_menu(files, &widget, x, y);
                 }
             });
             hbox.add_controller(click);
@@ -978,6 +1005,87 @@ impl Window {
             f.set_collapsed(!f.is_collapsed());
         }
         self.scroll_to_file(i);
+    }
+
+    /// The sidebar's context menu for files (one, or those under a directory): hide them, or
+    /// show them in full or as changes only.
+    fn show_file_menu(self: &Rc<Self>, files: Vec<usize>, parent: &gtk::Widget, x: f64, y: f64) {
+        let mode_of = |f: &FileView| match (f.is_folded(), f.is_collapsed()) {
+            (true, _) => "hidden",
+            (false, true) => "changes",
+            (false, false) => "full",
+        };
+        let (mode, has_texts) = {
+            let all = self.files.borrow();
+            let fs: Vec<_> = files.iter().filter_map(|&i| all.get(i)).collect();
+            let Some(first) = fs.first() else { return };
+            let mode = mode_of(first);
+            // No choice is marked when the files differ.
+            let mode = if fs.iter().all(|f| mode_of(f) == mode) {
+                mode
+            } else {
+                ""
+            };
+            (mode, fs.iter().any(|f| f.has_texts()))
+        };
+        let many = files.len() > 1;
+        let action = gio::SimpleAction::new_stateful(
+            "mode",
+            Some(glib::VariantTy::STRING),
+            &mode.to_variant(),
+        );
+        let weak = Rc::downgrade(self);
+        action.connect_activate(move |action, target| {
+            let Some(this) = weak.upgrade() else { return };
+            let Some(mode) = target.and_then(|t| t.str()) else {
+                return;
+            };
+            action.set_state(&mode.to_variant());
+            for &i in &files {
+                let Some(f) = this.files.borrow().get(i).cloned() else {
+                    continue;
+                };
+                f.set_folded(mode == "hidden");
+                if mode != "hidden" {
+                    f.set_collapsed(mode == "changes");
+                }
+            }
+            if mode != "hidden" {
+                this.scroll_to_file(files[0]);
+            }
+        });
+        let group = gio::SimpleActionGroup::new();
+        group.add_action(&action);
+
+        let menu = gio::Menu::new();
+        menu.append(
+            Some(if many { "Hide All" } else { "Hide" }),
+            Some("file.mode::hidden"),
+        );
+        if has_texts {
+            menu.append(
+                Some(if many { "Show Full Files" } else { "Show Full File" }),
+                Some("file.mode::full"),
+            );
+            menu.append(Some("Show Changes Only"), Some("file.mode::changes"));
+        } else {
+            menu.append(
+                Some(if many { "Show All" } else { "Show" }),
+                Some("file.mode::changes"),
+            );
+        }
+
+        parent.insert_action_group("file", Some(&group));
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(parent);
+        popover.set_has_arrow(false);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| {
+            // Not right away: the chosen item is activated after the menu closes.
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
     }
 
     /// Corresponding heights of the two columns, increasing on both, in content coordinates:

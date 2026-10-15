@@ -453,6 +453,11 @@ impl FileView {
         }
     }
 
+    /// Whether there are texts to show in full or as changes only (not binary, say).
+    pub fn has_texts(&self) -> bool {
+        self.texts.is_some()
+    }
+
     pub fn is_collapsed(&self) -> bool {
         self.collapsed.get()
     }
