@@ -1137,6 +1137,13 @@ impl FileView {
             popover.set_parent(&view);
             popover.set_has_arrow(false);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            // Parents are meant to present their popovers on every allocation, so they grow
+            // with their contents; layout managers do, but the text view only presents its
+            // own. Without this the menu keeps the size it first measured and scrolls.
+            popover.add_tick_callback(|popover, _| {
+                popover.present();
+                glib::ControlFlow::Continue
+            });
             popover.connect_closed(|popover| {
                 // Not right away: the chosen item is activated after the menu closes.
                 let popover = popover.clone();
