@@ -34,8 +34,9 @@ pub struct Window {
     tree_model: gtk::TreeListModel,
     selection: gtk::SingleSelection,
     tree_view: gtk::ListView,
-    /// Paths and statuses of the changed files, in file order, and the unchanged files.
-    tree_paths: RefCell<(Vec<(String, char)>, Vec<String>)>,
+    /// Paths, statuses and staging of the changed files, in file order, and the unchanged
+    /// files.
+    tree_paths: RefCell<(Vec<(String, char, Option<git::Staging>)>, Vec<String>)>,
     /// Directories whose unchanged files are shown, by full path ("" for the top level).
     unchanged_shown: RefCell<HashSet<String>>,
     /// The top level's row above the tree, for showing its unchanged files.
@@ -309,6 +310,7 @@ impl Window {
             search_settings,
             on_line_height: RefCell::default(),
             on_relayout: RefCell::default(),
+            on_reload: RefCell::default(),
             root: RefCell::default(),
             author: glib::user_name().to_string_lossy().into_owned(),
         });
@@ -489,7 +491,7 @@ impl Window {
             } else {
                 icon.set_icon_name(Some("text-x-generic-symbolic"));
                 status.set_label(&node.status.to_string());
-                status.set_css_classes(&["status", file_view::status_class(node.status)]);
+                file_view::style_status(&status, node.status, node.staging);
                 status.set_visible(node.changed);
             }
         });
@@ -657,6 +659,12 @@ impl Window {
             }
         }));
         let weak = Rc::downgrade(self);
+        *self.shared.on_reload.borrow_mut() = Some(Box::new(move || {
+            if let Some(this) = weak.upgrade() {
+                this.load();
+            }
+        }));
+        let weak = Rc::downgrade(self);
         *self.shared.on_relayout.borrow_mut() = Some(Box::new(move || {
             if let Some(this) = weak.upgrade() {
                 this.queue_sync();
@@ -821,7 +829,7 @@ impl Window {
         let order = {
             let paths: Vec<_> = changes
                 .iter()
-                .map(|f| (f.path.as_str(), f.status))
+                .map(|f| (f.path.as_str(), f.status, f.staging))
                 .collect();
             tree::file_order(&tree::build(&paths, &[], &HashSet::new()).children)
         };
@@ -829,7 +837,10 @@ impl Window {
         let changes: Vec<git::FileChange> =
             order.iter().map(|&i| slots[i].take().unwrap()).collect();
         *self.tree_paths.borrow_mut() = (
-            changes.iter().map(|f| (f.path.clone(), f.status)).collect(),
+            changes
+                .iter()
+                .map(|f| (f.path.clone(), f.status, f.staging))
+                .collect(),
             cmp.unchanged,
         );
 
@@ -900,7 +911,7 @@ impl Window {
         let scroll = adj.value();
 
         let paths = self.tree_paths.borrow();
-        let changed: Vec<_> = paths.0.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let changed: Vec<_> = paths.0.iter().map(|(p, s, st)| (p.as_str(), *s, *st)).collect();
         let unchanged: Vec<_> = paths.1.iter().map(String::as_str).collect();
         let root = tree::build(&changed, &unchanged, &self.unchanged_shown.borrow());
         let label = self.root_row.first_child().unwrap().next_sibling().unwrap();

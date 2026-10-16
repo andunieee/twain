@@ -83,6 +83,36 @@ pub struct FileChange {
     pub status: char,
     pub old: Content,
     pub new: Content,
+    /// The file in the index, when the new side is the working tree (`Missing` if it isn't
+    /// there). `None` otherwise, and for conflicted files.
+    pub index: Option<Content>,
+    /// How much of the change is staged, when the new side is the working tree.
+    pub staging: Option<Staging>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Staging {
+    Unstaged,
+    Partly,
+    Staged,
+}
+
+impl Staging {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Staging::Unstaged => "unstaged",
+            Staging::Partly => "partly-staged",
+            Staging::Staged => "staged",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Staging::Unstaged => "Not staged",
+            Staging::Partly => "Partly staged",
+            Staging::Staged => "Staged",
+        }
+    }
 }
 
 pub struct Comparison {
@@ -252,6 +282,24 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         }
     }
 
+    // Which files have staged (old side → index) and unstaged (index → working tree) changes.
+    let (staged, unstaged) = if matches!(new_side, NewSide::WorkTree) {
+        let names = |args: &[&str]| -> Result<std::collections::HashSet<String>, String> {
+            Ok(git(&root, args)?
+                .split(|&b| b == 0)
+                .filter(|f| !f.is_empty())
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .collect())
+        };
+        let common = ["diff", "-z", "--name-only", "--no-ext-diff", "--no-renames"];
+        (
+            names(&[&common[..], &["--cached", &old_rev, "--"]].concat())?,
+            names(&[&common[..], &["--"]].concat())?,
+        )
+    } else {
+        Default::default()
+    };
+
     let listing = match &new_side {
         NewSide::WorkTree | NewSide::Index => git(&root, &["ls-files", "-z"])?,
         NewSide::Rev(r) => git(&root, &["ls-tree", "-r", "-z", "--name-only", r])?,
@@ -283,12 +331,31 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
                     NewSide::Rev(r) => blob(&root, &format!("{r}:{path}")),
                 },
             };
+            let worktree = matches!(new_side, NewSide::WorkTree);
+            let index = match status {
+                _ if !worktree => None,
+                'U' => None,
+                '?' => Some(Content::Missing),
+                _ => Some(blob(&root, &format!(":{path}"))),
+            };
+            let staging = worktree.then(|| {
+                let touched = |set: &std::collections::HashSet<String>| {
+                    set.contains(&path) || old_path.as_ref().is_some_and(|p| set.contains(p))
+                };
+                match (touched(&staged), status == '?' || touched(&unstaged)) {
+                    (true, false) => Staging::Staged,
+                    (true, true) => Staging::Partly,
+                    _ => Staging::Unstaged,
+                }
+            });
             FileChange {
                 path,
                 old_path,
                 status,
                 old,
                 new,
+                index,
+                staging,
             }
         })
         .collect();
@@ -301,6 +368,62 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
     })
 }
 
+/// Sets the index entry of `path` to `text`, or removes it if `None`.
+pub fn set_index(root: &Path, path: &str, text: Option<&str>) -> Result<(), String> {
+    let Some(text) = text else {
+        return git(root, &["update-index", "--force-remove", "--", path]).map(|_| ());
+    };
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object", "-w", "--stdin", "--no-filters"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("failed to write to git: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Keep the mode the file has in the index, or in HEAD, or else take the working tree's.
+    let first_word = |out: String| out.split_whitespace().next().map(str::to_string);
+    let mode = git_str(root, &["ls-files", "-s", "--", path])
+        .ok()
+        .and_then(first_word)
+        .or_else(|| {
+            git_str(root, &["ls-tree", "HEAD", "--", path])
+                .ok()
+                .and_then(first_word)
+        })
+        .unwrap_or_else(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let exec = std::fs::metadata(root.join(path))
+                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+            if exec { "100755" } else { "100644" }.to_string()
+        });
+    git(
+        root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("{mode},{hash},{path}"),
+        ],
+    )
+    .map(|_| ())
+}
+
 fn or_head(s: &str) -> String {
     if s.is_empty() {
         "HEAD".into()
@@ -311,4 +434,39 @@ fn or_head(s: &str) -> String {
 
 fn short(rev: &str) -> &str {
     if rev == EMPTY_TREE { "empty" } else { rev }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_index_stages_and_unstages() {
+        let root = std::env::temp_dir().join(format!("twain-index-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| git_str(&root, args).unwrap();
+        run(&["init", "-q"]);
+        std::fs::write(root.join("a"), "1\n2\n3\n").unwrap();
+        std::fs::write(root.join("gone"), "x\n").unwrap();
+        run(&["add", "."]);
+        run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        let staged = || run(&["diff", "--cached", "--name-status"]);
+
+        set_index(&root, "a", Some("1\nTWO\n3\n")).unwrap();
+        assert_eq!(run(&["show", ":a"]), "1\nTWO\n3");
+        assert_eq!(staged(), "M\ta");
+        set_index(&root, "a", Some("1\n2\n3\n")).unwrap();
+        assert_eq!(staged(), "");
+
+        std::fs::write(root.join("new"), "n\n").unwrap();
+        set_index(&root, "new", Some("n\n")).unwrap();
+        set_index(&root, "gone", None).unwrap();
+        assert_eq!(staged(), "D\tgone\nA\tnew");
+        // Unstaging a new file leaves it untracked.
+        set_index(&root, "new", None).unwrap();
+        assert_eq!(staged(), "D\tgone");
+        assert_eq!(run(&["status", "--short", "new"]), "?? new");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

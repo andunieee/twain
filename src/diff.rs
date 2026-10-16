@@ -92,6 +92,69 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<Block> {
     blocks
 }
 
+/// The lines of the changes in `blocks` (old → new) whose change is already in `index`:
+/// on the old side, the lines `index` no longer has; on the new side, the ones it already has.
+pub fn staged_lines(
+    blocks: &[Block],
+    old: &str,
+    index: &str,
+    new: &str,
+) -> [Vec<Range<usize>>; 2] {
+    let changed = |blocks: &[Block], side: usize| -> Vec<Range<usize>> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Change(c) => Some([&c.old, &c.new][side].clone()),
+                _ => None,
+            })
+            .filter(|r| !r.is_empty())
+            .collect()
+    };
+    // Old-side lines changed in the index, within the changes being shown.
+    let removed = changed(&diff_lines(old, index), 0);
+    let old_staged = changed(blocks, 0)
+        .iter()
+        .flat_map(|c| {
+            removed
+                .iter()
+                .map(|r| r.start.max(c.start)..r.end.min(c.end))
+                .collect::<Vec<_>>()
+        })
+        .filter(|r| !r.is_empty())
+        .collect();
+    // New-side lines not yet in the index are unstaged; the rest of the changes are staged.
+    let unstaged = changed(&diff_lines(index, new), 1);
+    let new_staged = unstaged
+        .iter()
+        .fold(changed(blocks, 1), |rs, cut| subtract(&rs, cut));
+    [old_staged, new_staged]
+}
+
+/// `index` with its differences from `target` that touch `range` (lines of `target`) undone,
+/// i.e. those lines of `target` copied in. Staging a change copies from the working tree,
+/// unstaging one copies from the old side.
+pub fn revise(index: &str, target: &str, range: &Range<usize>) -> String {
+    let lines: [Vec<&str>; 2] = [index, target].map(|t| t.split_inclusive('\n').collect());
+    let touches = |r: &Range<usize>| {
+        if range.is_empty() {
+            r.start <= range.start && range.start <= r.end
+        } else if r.is_empty() {
+            range.start <= r.start && r.start <= range.end
+        } else {
+            r.start < range.end && range.start < r.end
+        }
+    };
+    let mut out = String::with_capacity(index.len().max(target.len()));
+    for block in diff_lines(index, target) {
+        match block {
+            Block::Equal { old, len, .. } => out.extend(lines[0][old..old + len].iter().copied()),
+            Block::Change(c) if touches(&c.new) => out.extend(lines[1][c.new].iter().copied()),
+            Block::Change(c) => out.extend(lines[0][c.old].iter().copied()),
+        }
+    }
+    out
+}
+
 /// Changed char ranges in the old and the new text.
 pub type InlineChanges = (Vec<Range<usize>>, Vec<Range<usize>>);
 
@@ -537,6 +600,43 @@ mod tests {
         assert_eq!(map_y(&anchors, 1, 35.0), 15.0);
         assert_eq!(map_y(&anchors, 0, 25.0), 45.0);
         assert_eq!(map_y(&anchors, 0, -5.0), -5.0);
+    }
+
+    #[test]
+    fn staged_lines_split_changes() {
+        let old = "a\nb\nc\nd\ne\n";
+        // b → B staged, d removed but not staged, x added and staged, y added but not.
+        let index = "a\nB\nc\nd\ne\nx\n";
+        let new = "a\nB\nc\ne\nx\ny\n";
+        let blocks = diff_lines(old, new);
+        let [o, n] = staged_lines(&blocks, old, index, new);
+        assert_eq!(o, vec![1..2]);
+        assert_eq!(n, vec![1..2, 4..5]);
+        // Nothing staged.
+        assert_eq!(staged_lines(&blocks, old, old, new), [vec![], Vec::<Range<usize>>::new()]);
+        // Everything staged.
+        let [o, n] = staged_lines(&blocks, old, new, new);
+        assert_eq!((o, n), (vec![1..2, 3..4], vec![1..2, 4..6]));
+    }
+
+    #[test]
+    fn revise_stages_and_unstages_one_change() {
+        let old = "a\nb\nc\nd\ne\nf\n";
+        let new = "a\nB\nc\nd\nE\nf\n";
+        // Stage the second change only.
+        let index = revise(old, new, &(4..5));
+        assert_eq!(index, "a\nb\nc\nd\nE\nf\n");
+        // Then the first; then unstage the second.
+        let index = revise(&index, new, &(1..2));
+        assert_eq!(index, new);
+        assert_eq!(revise(&index, old, &(4..5)), "a\nB\nc\nd\ne\nf\n");
+        // A deletion, at the position of the empty range on the target side.
+        let new = "a\nc\n";
+        assert_eq!(revise("a\nb\nc\n", new, &(1..1)), "a\nc\n");
+        // An insertion, unstaged.
+        assert_eq!(revise("a\nx\nb\n", "a\nb\n", &(1..1)), "a\nb\n");
+        // Without a trailing newline.
+        assert_eq!(revise("a\nb", "a\nB", &(1..2)), "a\nB");
     }
 
     #[test]

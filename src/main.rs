@@ -29,7 +29,10 @@ const CSS: &str = r#"
     min-width: 1.4em;
     border-radius: 4px;
     padding: 0 4px;
+    border: 1px solid transparent;
 }
+.status.staged { border-color: currentColor; }
+.status.partly-staged { border-style: dashed; border-color: currentColor; }
 .status-added { color: @success_color; background: alpha(@success_color, 0.15); }
 .status-deleted { color: @error_color; background: alpha(@error_color, 0.15); }
 .status-modified { color: @accent_color; background: alpha(@accent_color, 0.15); }

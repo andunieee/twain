@@ -9,7 +9,7 @@
 use crate::comment_card::{Action, Card};
 use crate::comments::{self, Comment, Location, Side as CommentSide};
 use crate::diff::{self, Block, ChunkKind, Gap, Layout, Note};
-use crate::git::{Content, FileChange};
+use crate::git::{Content, FileChange, Staging};
 use gtk::prelude::*;
 use gtk::{cairo, gdk, gio, glib, graphene};
 use sourceview5::prelude::*;
@@ -166,6 +166,8 @@ pub struct Shared {
     pub on_line_height: RefCell<Option<Box<dyn Fn()>>>,
     /// Called after a file's layout changes.
     pub on_relayout: RefCell<Option<Box<dyn Fn()>>>,
+    /// Reloads the comparison, after the index changes.
+    pub on_reload: RefCell<Option<Box<dyn Fn()>>>,
     /// Repository root, as comments are keyed by it.
     pub root: RefCell<String>,
     /// Author of comments written in this window.
@@ -196,8 +198,7 @@ impl Half {
         fold.set_tooltip_text(Some("Hide file"));
         header_box.append(&fold);
         let status = gtk::Label::new(Some(&change.status.to_string()));
-        status.add_css_class("status");
-        status.add_css_class(status_class(change.status));
+        style_status(&status, change.status, change.staging);
         header_box.append(&status);
         let title = match (&change.old_path, side) {
             (Some(old), 0) => old,
@@ -278,6 +279,9 @@ pub struct FileView {
     sides: OnceCell<[Side; 2]>,
     search_contexts: OnceCell<[sourceview5::SearchContext; 2]>,
     blocks: Vec<Block>,
+    /// Changed lines on each side whose change is staged: on the old side, lines the index
+    /// no longer has; on the new side, lines that are already in the index.
+    staged: [Vec<std::ops::Range<usize>>; 2],
     collapsed: Cell<bool>,
     /// Only the header is shown.
     folded: Cell<bool>,
@@ -285,6 +289,8 @@ pub struct FileView {
     revealed: RefCell<Vec<std::ops::Range<usize>>>,
     /// The region (on the old side) the text's context menu offers to hide again.
     menu_region: RefCell<Option<std::ops::Range<usize>>>,
+    /// The change the text's context menu offers to stage (true) or unstage (false).
+    menu_stage: RefCell<Option<(bool, diff::Chunk)>>,
     pub layout: RefCell<Layout>,
     /// Comment cards (including one being written) and where their lines are.
     cards: RefCell<Vec<(Card, Location)>>,
@@ -308,6 +314,12 @@ impl FileView {
             Block::Change(c) => (a + c.new.len(), r + c.old.len()),
             _ => (a, r),
         });
+        let staged = match &change.index {
+            Some(index) if is_text && has_changes && index.is_text() => {
+                diff::staged_lines(&blocks, &old_text, &diff::sanitize(index.text()), &new_text)
+            }
+            _ => Default::default(),
+        };
         let texts = (is_text && has_changes).then_some([old_text, new_text]);
         let message = match (&change.old, &change.new) {
             _ if texts.is_some() => None,
@@ -329,10 +341,12 @@ impl FileView {
             sides: OnceCell::new(),
             search_contexts: OnceCell::new(),
             blocks,
+            staged,
             collapsed: Cell::new(collapsed),
             folded: Cell::new(false),
             revealed: RefCell::default(),
             menu_region: RefCell::default(),
+            menu_stage: RefCell::default(),
             layout: RefCell::default(),
             cards: RefCell::default(),
             on_toggle: RefCell::default(),
@@ -445,6 +459,7 @@ impl FileView {
                 }
             });
             self.setup_comment_input(i, side);
+            self.setup_staged_tooltip(i, side);
         }
         let _ = self.sides.set(sides);
         self.relayout();
@@ -1025,6 +1040,16 @@ impl FileView {
             }
         });
         group.add_action(&action);
+        let action = gio::SimpleAction::new("stage", None);
+        let weak = self.weak_self.clone();
+        action.connect_activate(move |_, _| {
+            if let Some(this) = weak.upgrade()
+                && let Some((stage, chunk)) = this.menu_stage.take()
+            {
+                this.stage(stage, &chunk);
+            }
+        });
+        group.add_action(&action);
         side.view.insert_action_group("side", Some(&group));
 
         let keys = gtk::EventControllerKey::new();
@@ -1090,6 +1115,24 @@ impl FileView {
             menu.append_section(None, &section);
             *this.menu_region.borrow_mut() = region.map(|r| r[0].clone());
 
+            let chunk = this.can_stage().then(|| {
+                this.blocks.iter().find_map(|b| match b {
+                    Block::Change(c) if [&c.old, &c.new][i].contains(&line) => Some(c.clone()),
+                    _ => None,
+                })
+            });
+            let stage = chunk.flatten().map(|c| {
+                let staged = this.staged[i].iter().any(|r| r.contains(&line));
+                (!staged, c)
+            });
+            if let Some((stage, _)) = &stage {
+                let section = gio::Menu::new();
+                let label = if *stage { "Stage Change" } else { "Unstage Change" };
+                section.append(Some(label), Some("side.stage"));
+                menu.append_section(None, &section);
+            }
+            *this.menu_stage.borrow_mut() = stage;
+
             let popover = gtk::PopoverMenu::from_model(Some(&menu));
             popover.set_parent(&view);
             popover.set_has_arrow(false);
@@ -1102,6 +1145,74 @@ impl FileView {
             popover.popup();
         });
         side.view.add_controller(click);
+    }
+
+    /// Whether changes can be staged and unstaged here: the new side is the working tree, and
+    /// the text is all there is (not lossily decoded, not a rename).
+    fn can_stage(&self) -> bool {
+        let c = &self.change;
+        let intact = |content: &Content| match content {
+            Content::Text(t) => !t.contains('\u{FFFD}'),
+            Content::Missing => true,
+            _ => false,
+        };
+        self.texts.is_some()
+            && c.old_path.is_none()
+            && c.index.as_ref().is_some_and(intact)
+            && intact(&c.old)
+            && intact(&c.new)
+    }
+
+    /// Stages (copies to the index from the working tree) or unstages (copies from the old
+    /// side) the parts of a change that aren't already so, then reloads.
+    fn stage(&self, stage: bool, chunk: &diff::Chunk) {
+        let c = &self.change;
+        let Some(index) = &c.index else { return };
+        let (target, range) = match stage {
+            true => (&c.new, &chunk.new),
+            false => (&c.old, &chunk.old),
+        };
+        let text = diff::revise(index.text(), target.text(), range);
+        // A file that's entirely gone from the index rather than empty in it.
+        let removed = text.is_empty() && matches!(target, Content::Missing);
+        let root = std::path::PathBuf::from(&*self.shared.root.borrow());
+        if let Err(err) = crate::git::set_index(&root, &c.path, (!removed).then_some(&text)) {
+            eprintln!("twain: could not update the index for {}: {err}", c.path);
+        }
+        if let Some(f) = &*self.shared.on_reload.borrow() {
+            f();
+        }
+    }
+
+    /// Says "Staged" over the hatched lines.
+    fn setup_staged_tooltip(&self, i: usize, side: &Side) {
+        if self.staged[i].is_empty() {
+            return;
+        }
+        side.view.set_has_tooltip(true);
+        let weak = self.weak_self.clone();
+        side.view.connect_query_tooltip(move |view, x, y, keyboard, tooltip| {
+            let Some(this) = weak.upgrade() else {
+                return false;
+            };
+            if keyboard {
+                return false;
+            }
+            let (_, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x, y);
+            let (iter, _) = view.line_at_y(by);
+            let line = iter.line() as usize;
+            if !this.staged[i].iter().any(|r| r.contains(&line)) {
+                return false;
+            }
+            // Not over the space above the line, where comment cards and gap bands go.
+            let layout = this.layout.borrow();
+            let top = layout.line_y(i, line);
+            if by < top || by >= top + layout.line_height() {
+                return false;
+            }
+            tooltip.set_text(Some("Staged"));
+            true
+        });
     }
 
     fn side_width(&self, side: usize) -> i32 {
@@ -1246,6 +1357,30 @@ impl FileView {
             let _ = cr.fill();
         }
 
+        // Staged lines are hatched.
+        let fg = area.color();
+        let (r, g, b) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
+        for range in &self.staged[side] {
+            cr.save().ok();
+            for line in range.clone() {
+                cr.rectangle(0.0, layout.line_y(side, line) as f64, w, lh);
+            }
+            cr.clip();
+            let y0 = layout.line_y(side, range.start) as f64;
+            let y1 = layout.line_y(side, range.end - 1) as f64 + lh;
+            const STEP: f64 = 7.0;
+            let mut x = -(y1 - y0) - (y0 % STEP);
+            while x < w {
+                cr.move_to(x, y1);
+                cr.line_to(x + (y1 - y0), y0);
+                x += STEP;
+            }
+            cr.set_line_width(1.5);
+            cr.set_source_rgba(r, g, b, 0.10);
+            let _ = cr.stroke();
+            cr.restore().ok();
+        }
+
         cr.set_line_width(1.0);
         for chunk in &layout.chunks {
             let (r, g, b) = kind_color(chunk.kind);
@@ -1258,7 +1393,6 @@ impl FileView {
             let _ = cr.stroke();
         }
 
-        let fg = area.color();
         for gap in &layout.gaps {
             let (y, h) = (gap.y[side] as f64, gap.height as f64);
             cr.rectangle(0.0, y, w, h);
@@ -1337,7 +1471,16 @@ fn fold_case(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-pub fn status_class(status: char) -> &'static str {
+/// Styles a status badge: its color says what happened to the file, its border how much of
+/// that is staged.
+pub fn style_status(label: &gtk::Label, status: char, staging: Option<Staging>) {
+    let mut classes = vec!["status", status_class(status)];
+    classes.extend(staging.map(Staging::css_class));
+    label.set_css_classes(&classes);
+    label.set_tooltip_text(staging.map(Staging::describe));
+}
+
+fn status_class(status: char) -> &'static str {
     match status {
         'A' | '?' => "status-added",
         'D' => "status-deleted",

@@ -1,5 +1,6 @@
 //! The directory tree shown in the sidebar.
 
+use crate::git::Staging;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
@@ -11,6 +12,7 @@ pub struct Node {
     /// Whether this is a changed file or a directory containing one.
     pub changed: bool,
     pub status: char,
+    pub staging: Option<Staging>,
     /// For directories, the full paths of the directories merged into this node, outermost
     /// first ("src", "src/ui" for "src/ui").
     pub chain: Vec<String>,
@@ -22,7 +24,7 @@ pub struct Node {
 #[derive(Default)]
 struct Dir<'a> {
     dirs: BTreeMap<&'a str, Dir<'a>>,
-    files: Vec<(&'a str, Option<usize>, char)>,
+    files: Vec<(&'a str, Option<usize>, char, Option<Staging>)>,
     changed: bool,
 }
 
@@ -32,15 +34,15 @@ struct Ctx<'a> {
     hiding: HashSet<&'a str>,
 }
 
-/// Builds a tree from `(path, status)` pairs of changed files plus the paths of `unchanged`
+/// Builds a tree from `(path, status, staging)` triples of changed files plus the paths of `unchanged`
 /// ones, which are only included in the directories listed in `shown` (the full paths, with
 /// "" for the top level). Directories come before files and chains of single-child
 /// directories are merged ("src/ui" instead of "src" → "ui") unless the outer one is shown.
 /// Returns the top level as a directory node with an empty name.
-pub fn build(paths: &[(&str, char)], unchanged: &[&str], shown: &HashSet<String>) -> Node {
+pub fn build(paths: &[(&str, char, Option<Staging>)], unchanged: &[&str], shown: &HashSet<String>) -> Node {
     let mut root = Dir::default();
     let mut changed_dirs = HashSet::new();
-    for (i, &(path, status)) in paths.iter().enumerate() {
+    for (i, &(path, status, staging)) in paths.iter().enumerate() {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         let mut d = &mut root;
         if !dir.is_empty() {
@@ -52,7 +54,7 @@ pub fn build(paths: &[(&str, char)], unchanged: &[&str], shown: &HashSet<String>
                 d.changed = true;
             }
         }
-        d.files.push((name, Some(i), status));
+        d.files.push((name, Some(i), status, staging));
     }
 
     let mut hiding = HashSet::new();
@@ -75,7 +77,7 @@ pub fn build(paths: &[(&str, char)], unchanged: &[&str], shown: &HashSet<String>
             match path[start..].find('/') {
                 None => {
                     if open {
-                        d.files.push((&path[start..], None, ' '));
+                        d.files.push((&path[start..], None, ' ', None));
                     }
                     break;
                 }
@@ -97,6 +99,7 @@ pub fn build(paths: &[(&str, char)], unchanged: &[&str], shown: &HashSet<String>
         file: None,
         changed: !paths.is_empty(),
         status: ' ',
+        staging: None,
         chain: vec![String::new()],
         unchanged_shown: ctx.hiding.contains("").then(|| shown.contains("")),
         children: convert(root, "", &ctx),
@@ -135,6 +138,7 @@ fn convert(dir: Dir, prefix: &str, ctx: &Ctx) -> Vec<Rc<Node>> {
             file: None,
             changed: sub.changed,
             status: ' ',
+            staging: None,
             children: convert(sub, &last, ctx),
             chain,
             unchanged_shown,
@@ -142,13 +146,14 @@ fn convert(dir: Dir, prefix: &str, ctx: &Ctx) -> Vec<Rc<Node>> {
     }
     let mut files = dir.files;
     files.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, file, status) in files {
+    for (name, file, status, staging) in files {
         out.push(Rc::new(Node {
             name: name.into(),
             dir: false,
             file,
             changed: file.is_some(),
             status,
+            staging,
             chain: Vec::new(),
             unchanged_shown: None,
             children: Vec::new(),
