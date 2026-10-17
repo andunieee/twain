@@ -1,7 +1,7 @@
 //! `twain comment ...`: reading and writing comments from the command line, for agents and
 //! scripts. Talks to the same database as the windows, which pick up changes immediately.
 
-use crate::comments::{self, Comment, Side, Store};
+use crate::comments::{self, Comment, Item, Reply, Side, Store, Thread};
 use crate::git;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
@@ -15,22 +15,34 @@ unless --old is given, refer to the file as it is in the working tree (the right
 the diff). Comments follow their lines when the file changes; when the lines are gone the
 comment is reported as outdated.
 
+Each comment starts a thread that others can reply to. Replies have ids of their own, and
+wherever a command takes the id of a thread, the id of one of its replies works too.
+
 commands:
   list [--file <path>] [--unresolved] [--author <name>] [--json]
-      Show comments, with the code they're attached to.
+      Show threads: each comment with the code it's attached to, then its replies.
+      --author keeps the threads <name> wrote in.
+  show <id>... [--json]
+      Show the threads of these comments or replies.
   add --file <path> --line <n>[-<m>] [--old] [--author <name>] [-m <text>]...
       Add a comment on line n (through m). The text comes from -m (repeat for paragraphs)
       or stdin. The author defaults to \"agent\". Prints the new comment's id.
+  reply <id> [--author <name>] [-m <text>]...
+      Reply in a thread. Text and author as for add. Prints the new reply's id.
   edit <id> [-m <text>]...
-      Replace a comment's text (from -m or stdin).
+      Replace a comment's or reply's text (from -m or stdin).
   resolve <id>...  /  unresolve <id>...
+      Mark threads resolved, or not.
   rm <id>...
-  clear [--file <path>]
-      Delete every comment in the repository, or in one file.
+      Delete comments, with their replies, or single replies.
+  clear [--file <path>] [--older-than <age>]
+      Delete every comment in the repository, or in one file, with their replies. With
+      --older-than, only the comments written before then: an age such as 90m, 12h, 7d or
+      2w, or a date such as 2026-09-01.
   watch [--file <path>] [--author <name>] [--not-author <name>] [--once] [--timeout <secs>] [--json]
-      Wait for comments to be added, changed or removed, and print each change. With
-      --once, exit after the first one; e.g. `twain comment watch --once --not-author agent`
-      waits for a human to say something.
+      Wait for comments or replies to be added, changed or removed, and print each change.
+      With --once, exit after the first one; e.g. `twain comment watch --once --not-author
+      agent` waits for a human to say something.
 
 Ids may be abbreviated to any unambiguous prefix. -C <dir> runs in another repository.";
 
@@ -47,6 +59,8 @@ struct Args {
     unresolved: bool,
     once: bool,
     timeout: Option<u64>,
+    /// Unix time from --older-than.
+    before: Option<i64>,
     ids: Vec<String>,
 }
 
@@ -71,6 +85,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 let v = value("--timeout")?;
                 a.timeout = Some(v.parse().map_err(|_| format!("bad timeout: {v}"))?);
             }
+            "--older-than" => a.before = Some(parse_age(&value("--older-than")?)?),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => a.ids.push(arg),
         }
@@ -92,7 +107,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> i32 {
         let ctx = Ctx::new(&a)?;
         match cmd.as_str() {
             "list" | "ls" => ctx.list(&a),
+            "show" => ctx.show(&a),
             "add" => ctx.add(&a),
+            "reply" => ctx.reply(&a),
             "edit" => ctx.edit(&a),
             "resolve" => ctx.set_resolved(&a, true),
             "unresolve" => ctx.set_resolved(&a, false),
@@ -177,7 +194,7 @@ impl Ctx {
         a.file.as_deref().map(|f| self.rel_path(f)).transpose()
     }
 
-    fn find_all(&self, ids: &[String]) -> Result<Vec<Comment>, String> {
+    fn find_all(&self, ids: &[String]) -> Result<Vec<Item>, String> {
         if ids.is_empty() {
             return Err("no comment id given".into());
         }
@@ -186,20 +203,36 @@ impl Ctx {
             .collect()
     }
 
-    fn list(&self, a: &Args) -> Result<(), String> {
-        let file = self.file_filter(a)?;
-        let mut texts = HashMap::new();
-        let mut out = Vec::new();
-        for c in self.store.list(&self.root_key, file.as_deref())? {
-            if a.unresolved && c.resolved || a.author.as_ref().is_some_and(|x| *x != c.author) {
-                continue;
-            }
-            let text = texts
-                .entry(c.path.clone())
-                .or_insert_with(|| self.worktree_text(&c.path));
-            out.push(Located::new(c, text.as_deref()));
+    /// The comments of the threads with these ids, each once.
+    fn find_threads(&self, ids: &[String]) -> Result<Vec<Thread>, String> {
+        if ids.is_empty() {
+            return Err("no comment id given".into());
         }
-        if a.json {
+        let mut out: Vec<Thread> = Vec::new();
+        for id in ids {
+            let t = self.store.find_thread(&self.root_key, id)?;
+            if !out
+                .iter()
+                .any(|o| (&o.comment.path, &o.comment.id) == (&t.comment.path, &t.comment.id))
+            {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    fn print_threads(&self, threads: Vec<Thread>, json: bool) {
+        let mut texts = HashMap::new();
+        let out: Vec<Located> = threads
+            .into_iter()
+            .map(|t| {
+                let text = texts
+                    .entry(t.comment.path.clone())
+                    .or_insert_with(|| self.worktree_text(&t.comment.path));
+                Located::new(t, text.as_deref())
+            })
+            .collect();
+        if json {
             let values: Vec<_> = out.iter().map(Located::to_json).collect();
             println!("{}", serde_json::to_string_pretty(&values).unwrap());
         } else if out.is_empty() {
@@ -212,6 +245,28 @@ impl Ctx {
                 print!("{}", l.render());
             }
         }
+    }
+
+    fn list(&self, a: &Args) -> Result<(), String> {
+        let file = self.file_filter(a)?;
+        let threads = self
+            .store
+            .threads(&self.root_key, file.as_deref())?
+            .into_iter()
+            .filter(|t| !(a.unresolved && t.comment.resolved))
+            .filter(|t| {
+                a.author.as_ref().is_none_or(|x| {
+                    t.comment.author == *x || t.replies.iter().any(|r| r.author == *x)
+                })
+            })
+            .collect();
+        self.print_threads(threads, a.json);
+        Ok(())
+    }
+
+    fn show(&self, a: &Args) -> Result<(), String> {
+        let threads = self.find_threads(&a.ids)?;
+        self.print_threads(threads, a.json);
         Ok(())
     }
 
@@ -250,18 +305,46 @@ impl Ctx {
         Ok(())
     }
 
+    fn reply(&self, a: &Args) -> Result<(), String> {
+        let [id] = a.ids.as_slice() else {
+            return Err("reply needs exactly one id".into());
+        };
+        let thread = self.store.find_thread(&self.root_key, id)?;
+        let body = message(a)?;
+        let author = a.author.as_deref().unwrap_or("agent");
+        let mut r = Reply::new(&thread.comment, &body, author);
+        self.store
+            .put_replies(&self.root_key, std::slice::from_mut(&mut r))?;
+        println!("{}", r.id);
+        Ok(())
+    }
+
     fn edit(&self, a: &Args) -> Result<(), String> {
         let [id] = a.ids.as_slice() else {
             return Err("edit needs exactly one id".into());
         };
-        let mut c = self.store.find(&self.root_key, id)?;
-        c.body = message(a)?;
-        c.updated = comments::now();
-        self.store.put(&self.root_key, std::slice::from_mut(&mut c))
+        let body = message(a)?;
+        match self.store.find(&self.root_key, id)? {
+            Item::Comment(mut c) => {
+                c.body = body;
+                c.updated = comments::now();
+                self.store.put(&self.root_key, std::slice::from_mut(&mut c))
+            }
+            Item::Reply(mut r) => {
+                r.body = body;
+                r.updated = comments::now();
+                self.store
+                    .put_replies(&self.root_key, std::slice::from_mut(&mut r))
+            }
+        }
     }
 
     fn set_resolved(&self, a: &Args, resolved: bool) -> Result<(), String> {
-        let mut found = self.find_all(&a.ids)?;
+        let mut found: Vec<Comment> = self
+            .find_threads(&a.ids)?
+            .into_iter()
+            .map(|t| t.comment)
+            .collect();
         for c in &mut found {
             c.resolved = resolved;
             c.updated = comments::now();
@@ -270,18 +353,30 @@ impl Ctx {
     }
 
     fn rm(&self, a: &Args) -> Result<(), String> {
-        let found = self.find_all(&a.ids)?;
-        self.store.delete(&self.root_key, &found)
+        let (mut found, mut replies) = (Vec::new(), Vec::new());
+        for item in self.find_all(&a.ids)? {
+            match item {
+                Item::Comment(c) => found.push(c),
+                Item::Reply(r) => replies.push(r),
+            }
+        }
+        self.store.delete(&self.root_key, &found)?;
+        self.store.delete_replies(&self.root_key, &replies)
     }
 
     fn clear(&self, a: &Args) -> Result<(), String> {
         let file = self.file_filter(a)?;
-        let all = self.store.list(&self.root_key, file.as_deref())?;
-        self.store.delete(&self.root_key, &all)?;
+        let found: Vec<Comment> = self
+            .store
+            .list(&self.root_key, file.as_deref())?
+            .into_iter()
+            .filter(|c| a.before.is_none_or(|t| c.created < t))
+            .collect();
+        let replies = self.store.delete(&self.root_key, &found)?;
         eprintln!(
-            "deleted {} comment{}",
-            all.len(),
-            if all.len() == 1 { "" } else { "s" }
+            "deleted {} and {}",
+            plural(found.len(), "comment"),
+            plural(replies, "reply")
         );
         Ok(())
     }
@@ -290,12 +385,14 @@ impl Ctx {
         let file = self.file_filter(a)?;
         // Bind before reading the current state, so no write falls in between.
         let listener = comments::Listener::bind().map_err(|e| format!("cannot listen: {e}"))?;
-        let mut known: HashMap<(String, String), Comment> = self
-            .store
-            .list(&self.root_key, file.as_deref())?
-            .into_iter()
-            .map(|c| ((c.path.clone(), c.id.clone()), c))
-            .collect();
+        let mut known: HashMap<(String, String), Comment> = HashMap::new();
+        let mut known_replies: HashMap<(String, String, String), Reply> = HashMap::new();
+        for t in self.store.threads(&self.root_key, file.as_deref())? {
+            for r in t.replies {
+                known_replies.insert((r.path.clone(), r.comment.clone(), r.id.clone()), r);
+            }
+            known.insert((t.comment.path.clone(), t.comment.id.clone()), t.comment);
+        }
         let deadline = a
             .timeout
             .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
@@ -326,29 +423,73 @@ impl Ctx {
             if key.root != self.root_key || file.as_ref().is_some_and(|f| *f != key.path) {
                 continue;
             }
-            let id = (key.path.clone(), key.id.clone());
-            let (event, comment) = match self.store.get(&self.root_key, &key.path, &key.id)? {
-                Some(c) => match known.insert(id, c.clone()) {
-                    Some(old) if old == c => continue,
-                    Some(_) => ("updated", c),
-                    None => ("added", c),
-                },
-                None => match known.remove(&id) {
-                    Some(old) => ("removed", old),
-                    None => continue,
-                },
+            let worktree = self.worktree_text(&key.path);
+            let (author, json, text) = if let Some(rid) = &key.reply {
+                let id = (key.path.clone(), key.id.clone(), rid.clone());
+                let stored = self
+                    .store
+                    .get_reply(&self.root_key, &key.path, &key.id, rid)?;
+                let (event, reply) = match stored {
+                    Some(r) => match known_replies.insert(id, r.clone()) {
+                        Some(old) if old == r => continue,
+                        Some(_) => ("updated", r),
+                        None => ("added", r),
+                    },
+                    None => match known_replies.remove(&id) {
+                        Some(old) => ("removed", old),
+                        None => continue,
+                    },
+                };
+                // Where the thread is, if it's still there.
+                let parent = self
+                    .store
+                    .get(&self.root_key, &key.path, &key.id)?
+                    .map(|c| {
+                        Located::new(
+                            Thread {
+                                comment: c,
+                                replies: Vec::new(),
+                            },
+                            worktree.as_deref(),
+                        )
+                    });
+                let json = serde_json::json!({ "event": event, "reply": reply });
+                let text = format!("{event} reply: {}", render_reply(&reply, parent.as_ref()));
+                (reply.author, json, text)
+            } else {
+                let id = (key.path.clone(), key.id.clone());
+                let (event, comment) = match self.store.get(&self.root_key, &key.path, &key.id)? {
+                    Some(c) => match known.insert(id, c.clone()) {
+                        Some(old) if old == c => continue,
+                        Some(_) => ("updated", c),
+                        None => ("added", c),
+                    },
+                    None => match known.remove(&id) {
+                        Some(old) => ("removed", old),
+                        None => continue,
+                    },
+                };
+                let author = comment.author.clone();
+                let thread = match event {
+                    "removed" => Thread {
+                        comment,
+                        replies: Vec::new(),
+                    },
+                    _ => self.store.thread(&self.root_key, comment)?,
+                };
+                let located = Located::new(thread, worktree.as_deref());
+                let json = serde_json::json!({ "event": event, "comment": located.to_json() });
+                (author, json, format!("{event}: {}", located.render()))
             };
-            if a.author.as_ref().is_some_and(|x| *x != comment.author)
-                || a.not_author.as_ref().is_some_and(|x| *x == comment.author)
+            if a.author.as_ref().is_some_and(|x| *x != author)
+                || a.not_author.as_ref().is_some_and(|x| *x == author)
             {
                 continue;
             }
-            let located = Located::new(comment, self.worktree_text(&key.path).as_deref());
             if a.json {
-                let v = serde_json::json!({ "event": event, "comment": located.to_json() });
-                println!("{v}");
+                println!("{json}");
             } else {
-                print!("{event}: {}", located.render());
+                print!("{text}");
             }
             use std::io::Write;
             let _ = std::io::stdout().flush();
@@ -359,16 +500,51 @@ impl Ctx {
     }
 }
 
-/// A comment with the position of its lines in the current working tree.
+fn plural(n: usize, word: &str) -> String {
+    match (n, word.strip_suffix('y')) {
+        (1, _) => format!("1 {word}"),
+        (_, Some(stem)) => format!("{n} {stem}ies"),
+        _ => format!("{n} {word}s"),
+    }
+}
+
+fn format_time(t: i64) -> String {
+    gtk::glib::DateTime::from_unix_local(t)
+        .and_then(|d| d.format("%Y-%m-%d %H:%M"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// A reply on its own, with where its thread is when known.
+fn render_reply(r: &Reply, thread: Option<&Located>) -> String {
+    let place = match thread {
+        Some(l) => format!("{}:{}", r.path, l.lines()),
+        None => r.path.clone(),
+    };
+    let mut out = format!(
+        "{}  in thread {} on {place}  — {}, {}\n",
+        r.id,
+        r.comment,
+        r.author,
+        format_time(r.updated)
+    );
+    for l in r.body.lines() {
+        out += &format!("    {l}\n");
+    }
+    out
+}
+
+/// A thread with the position of its lines in the current working tree.
 struct Located {
-    comment: Comment,
+    thread: Thread,
     start: usize,
     end: usize,
     outdated: bool,
 }
 
 impl Located {
-    fn new(comment: Comment, worktree: Option<&str>) -> Located {
+    fn new(thread: Thread, worktree: Option<&str>) -> Located {
+        let comment = &thread.comment;
         let (start, end, outdated) = match (comment.side, worktree) {
             (Side::New, Some(text)) => {
                 let loc = comment.locate(text);
@@ -378,28 +554,32 @@ impl Located {
             (Side::Old, _) => (comment.start, comment.end, false),
         };
         Located {
-            comment,
+            thread,
             start,
             end,
             outdated,
         }
     }
 
+    fn lines(&self) -> String {
+        if self.start == self.end {
+            format!("{}", self.start)
+        } else {
+            format!("{}-{}", self.start, self.end)
+        }
+    }
+
     fn to_json(&self) -> serde_json::Value {
-        let mut v = serde_json::to_value(&self.comment).unwrap();
+        let mut v = serde_json::to_value(&self.thread.comment).unwrap();
         v["start"] = self.start.into();
         v["end"] = self.end.into();
         v["outdated"] = self.outdated.into();
+        v["replies"] = serde_json::to_value(&self.thread.replies).unwrap();
         v
     }
 
     fn render(&self) -> String {
-        let c = &self.comment;
-        let lines = if self.start == self.end {
-            format!("{}", self.start)
-        } else {
-            format!("{}-{}", self.start, self.end)
-        };
+        let c = &self.thread.comment;
         let mut flags = String::new();
         if c.side == Side::Old {
             flags.push_str(" (old side)");
@@ -410,13 +590,13 @@ impl Located {
         if self.outdated {
             flags.push_str(" [outdated]");
         }
-        let when = gtk::glib::DateTime::from_unix_local(c.updated)
-            .and_then(|d| d.format("%Y-%m-%d %H:%M"))
-            .map(|s| s.to_string())
-            .unwrap_or_default();
         let mut out = format!(
-            "{}  {}:{lines}{flags}  — {}, {when}\n",
-            c.id, c.path, c.author
+            "{}  {}:{}{flags}  — {}, {}\n",
+            c.id,
+            c.path,
+            self.lines(),
+            c.author,
+            format_time(c.updated)
         );
         for (i, l) in c.lines.iter().enumerate() {
             out += &format!("  {:>5} │ {l}\n", self.start + i);
@@ -424,8 +604,41 @@ impl Located {
         for l in c.body.lines() {
             out += &format!("    {l}\n");
         }
+        for r in &self.thread.replies {
+            out += &format!("  ↳ {}  — {}, {}\n", r.id, r.author, format_time(r.updated));
+            for l in r.body.lines() {
+                out += &format!("      {l}\n");
+            }
+        }
         out
     }
+}
+
+/// The time an --older-than spec stands for, as a Unix timestamp: an age (`90m`, `12h`,
+/// `7d`, `2w`, …) counted back from now, or a local date (`2026-09-01`).
+fn parse_age(spec: &str) -> Result<i64, String> {
+    let bad = || format!("bad age: {spec} (expected e.g. 30m, 12h, 7d, 2w or 2026-09-01)");
+    let date: Vec<&str> = spec.split('-').collect();
+    if let [y, m, d] = date.as_slice() {
+        let (Ok(y), Ok(m), Ok(d)) = (y.parse(), m.parse(), d.parse()) else {
+            return Err(bad());
+        };
+        return gtk::glib::DateTime::from_local(y, m, d, 0, 0, 0.0)
+            .map(|t| t.to_unix())
+            .map_err(|_| bad());
+    }
+    let split = spec.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let (n, unit) = spec.split_at(split);
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let secs = match unit {
+        "s" => 1,
+        "m" | "min" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 7 * 86400,
+        _ => return Err(bad()),
+    };
+    Ok(comments::now() - n.saturating_mul(secs))
 }
 
 fn parse_lines(spec: &str) -> Result<std::ops::Range<usize>, String> {
@@ -477,5 +690,26 @@ mod tests {
         assert_eq!(parse_lines("3:5"), Ok(2..5));
         assert!(parse_lines("5-3").is_err());
         assert!(parse_lines("0").is_err());
+    }
+
+    #[test]
+    fn age_specs() {
+        let now = comments::now();
+        let near = |t: Result<i64, String>, want: i64| (t.unwrap() - want).abs() <= 2;
+        assert!(near(parse_age("90m"), now - 90 * 60));
+        assert!(near(parse_age("7d"), now - 7 * 86400));
+        assert!(near(parse_age("2w"), now - 14 * 86400));
+        assert!(parse_age("2026-09-01").is_ok());
+        assert!(parse_age("7").is_err());
+        assert!(parse_age("d").is_err());
+        assert!(parse_age("7y").is_err());
+        assert!(parse_age("2026-13-01").is_err());
+    }
+
+    #[test]
+    fn plurals() {
+        assert_eq!(plural(1, "reply"), "1 reply");
+        assert_eq!(plural(2, "reply"), "2 replies");
+        assert_eq!(plural(0, "comment"), "0 comments");
     }
 }

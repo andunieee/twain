@@ -6,8 +6,8 @@
 //! sides aren't padded to line up: each column scrolls on its own, kept in sync through the
 //! layout's anchors, and the curved links between them are drawn by the window.
 
-use crate::comment_card::{Action, Card};
-use crate::comments::{self, Comment, Location, Side as CommentSide};
+use crate::comment_card::{Action, Card, Target};
+use crate::comments::{self, Comment, Location, Reply, Side as CommentSide, Thread};
 use crate::diff::{self, Block, ChunkKind, Gap, Layout, Note};
 use crate::git::{Content, FileChange, Staging};
 use gtk::prelude::*;
@@ -832,16 +832,16 @@ impl FileView {
     /// Re-reads this file's comments from the database.
     pub fn reload_comments(&self) {
         let root = self.root();
-        match comments::store().and_then(|s| s.list(&root, Some(&self.change.path))) {
+        match comments::store().and_then(|s| s.threads(&root, Some(&self.change.path))) {
             Ok(list) => self.set_comments(list),
             Err(e) => eprintln!("twain: {e}"),
         }
     }
 
     /// Shows these comments, keeping any that are being edited as they are.
-    pub fn set_comments(&self, list: Vec<Comment>) {
+    pub fn set_comments(&self, list: Vec<Thread>) {
         for (side, half) in self.halves.iter().enumerate() {
-            let n = list.iter().filter(|c| c.side.index() == side).count();
+            let n = list.iter().filter(|t| t.comment.side.index() == side).count();
             half.comment_count
                 .set_label(&format!("{n} comment{}", if n == 1 { "" } else { "s" }));
             half.comment_count.set_visible(n > 0);
@@ -857,13 +857,13 @@ impl FileView {
         }
         drop(cards);
         if let Some(texts) = &self.texts {
-            for comment in list {
+            for Thread { comment, replies } in list {
                 if kept.iter().any(|(c, _)| c.comment.id == comment.id) {
                     continue;
                 }
                 let loc = comment.locate(&texts[comment.side.index()]);
                 let outdated = loc.outdated;
-                kept.push((self.make_card(comment, outdated, false), loc));
+                kept.push((self.make_card(comment, replies, outdated, None), loc));
             }
         } else {
             for (card, _) in &kept {
@@ -883,7 +883,13 @@ impl FileView {
         self.relayout();
     }
 
-    fn make_card(&self, comment: Comment, outdated: bool, editing: bool) -> Card {
+    fn make_card(
+        &self,
+        comment: Comment,
+        replies: Vec<Reply>,
+        outdated: bool,
+        editing: Option<Target>,
+    ) -> Card {
         let (weak, id) = (self.weak_self.clone(), comment.id.clone());
         let act = Rc::new(move |action| {
             if let Some(this) = weak.upgrade() {
@@ -891,7 +897,7 @@ impl FileView {
             }
         });
         let side = comment.side.index();
-        let card = Card::new(comment, outdated, editing, act);
+        let card = Card::new(comment, replies, outdated, editing, act);
         self.halves[side].body.add_overlay(&card.widget);
         card
     }
@@ -917,62 +923,92 @@ impl FileView {
         }
     }
 
-    /// Replaces a card with a fresh one, as an editor or not; `None` removes it.
-    fn replace_card(&self, id: &str, editing: Option<bool>) {
+    /// Replaces a card with a fresh one, with an editor for `editing` or none.
+    fn replace_card(&self, id: &str, editing: Option<Target>) {
         let mut cards = self.cards.borrow_mut();
         let Some(i) = cards.iter().position(|(c, _)| c.comment.id == id) else {
             return;
         };
         let (old, loc) = cards.remove(i);
         self.remove_card_widget(&old);
-        if let Some(editing) = editing {
-            let card = self.make_card(old.comment, loc.outdated, editing);
-            cards.insert(i, (card, loc));
-        }
+        let card = self.make_card(old.comment, old.replies, loc.outdated, editing);
+        cards.insert(i, (card, loc));
+        drop(cards);
+        self.relayout();
+    }
+
+    fn remove_card(&self, id: &str) {
+        let mut cards = self.cards.borrow_mut();
+        let Some(i) = cards.iter().position(|(c, _)| c.comment.id == id) else {
+            return;
+        };
+        let (old, _) = cards.remove(i);
+        self.remove_card_widget(&old);
         drop(cards);
         self.relayout();
     }
 
     fn on_card_action(&self, id: &str, action: Action) {
-        let comment = self
+        let thread = self
             .cards
             .borrow()
             .iter()
             .find(|(c, _)| c.comment.id == id)
-            .map(|(c, _)| c.comment.clone());
-        let Some(mut comment) = comment else { return };
-        if matches!(action, Action::Save(_) | Action::Cancel)
+            .map(|(c, _)| (c.comment.clone(), c.replies.clone()));
+        let Some((mut comment, replies)) = thread else { return };
+        if matches!(action, Action::Save(..) | Action::Cancel)
             && let Some(sides) = self.sides()
         {
             // Rather than wherever focus would go once the editor is gone.
             sides[comment.side.index()].view.grab_focus();
         }
+        let reply = |rid: &str| replies.iter().find(|r| r.id == rid).cloned();
         let root = self.root();
         let result = match action {
             Action::Resize => {
                 self.relayout();
                 return;
             }
-            Action::Edit => {
-                self.replace_card(id, Some(true));
+            Action::Edit(target) => {
+                self.replace_card(id, Some(target));
                 self.focus_editor(id);
                 return;
             }
             Action::Cancel => {
-                self.replace_card(id, if id.is_empty() { None } else { Some(false) });
+                if id.is_empty() {
+                    self.remove_card(id);
+                } else {
+                    self.replace_card(id, None);
+                }
                 return;
             }
-            Action::Save(text) => {
-                if text.is_empty() {
-                    return;
-                }
+            Action::Save(_, text) if text.is_empty() => return,
+            Action::Save(Target::Comment, text) => {
                 comment.body = text;
                 comment.updated = comments::now();
                 // Stop editing, so that the reload below shows the saved version.
-                self.replace_card(id, None);
+                self.remove_card(id);
                 comments::store().and_then(|s| s.put(&root, &mut [comment]))
             }
-            Action::Delete => comments::store().and_then(|s| s.delete(&root, &[comment])),
+            Action::Save(Target::Reply(rid), text) => {
+                let mut r = if rid.is_empty() {
+                    Reply::new(&comment, &text, &self.shared.author)
+                } else {
+                    let Some(r) = reply(&rid) else { return };
+                    r
+                };
+                r.body = text;
+                r.updated = comments::now();
+                self.remove_card(id);
+                comments::store().and_then(|s| s.put_replies(&root, &mut [r]))
+            }
+            Action::Delete(Target::Comment) => {
+                comments::store().and_then(|s| s.delete(&root, &[comment]).map(drop))
+            }
+            Action::Delete(Target::Reply(rid)) => {
+                let Some(r) = reply(&rid) else { return };
+                comments::store().and_then(|s| s.delete_replies(&root, &[r]))
+            }
             Action::ToggleResolved => {
                 comment.resolved = !comment.resolved;
                 comment.updated = comments::now();
@@ -1001,7 +1037,7 @@ impl FileView {
             end -= 1;
         }
         // Only one new comment at a time.
-        self.replace_card("", None);
+        self.remove_card("");
         let comment = Comment::new(
             &self.change.path,
             CommentSide::from_index(side),
@@ -1014,7 +1050,7 @@ impl FileView {
             lines: start..end + 1,
             outdated: false,
         };
-        let card = self.make_card(comment, false, true);
+        let card = self.make_card(comment, Vec::new(), false, Some(Target::Comment));
         self.cards.borrow_mut().push((card, loc));
         self.relayout();
         self.focus_editor("");

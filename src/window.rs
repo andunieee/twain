@@ -868,12 +868,12 @@ impl Window {
             }
             files.push(fv);
         }
-        let mut by_path: std::collections::HashMap<String, Vec<comments::Comment>> =
+        let mut by_path: std::collections::HashMap<String, Vec<comments::Thread>> =
             std::collections::HashMap::new();
-        match comments::store().and_then(|s| s.list(&self.shared.root.borrow(), None)) {
+        match comments::store().and_then(|s| s.threads(&self.shared.root.borrow(), None)) {
             Ok(list) => list
                 .into_iter()
-                .for_each(|c| by_path.entry(c.path.clone()).or_default().push(c)),
+                .for_each(|t| by_path.entry(t.comment.path.clone()).or_default().push(t)),
             Err(e) => eprintln!("twain: {e}"),
         }
         for f in &files {

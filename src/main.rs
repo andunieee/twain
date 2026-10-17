@@ -54,6 +54,8 @@ const CSS: &str = r#"
 .comment-card.resolved { border-color: alpha(currentColor, 0.2); }
 .comment-card.resolved .comment-body { opacity: 0.6; }
 .comment-card button.circular { min-width: 24px; min-height: 24px; padding: 0; }
+.comment-reply { margin-top: 4px; padding: 6px 0 0 12px; border-top: 1px solid alpha(currentColor, 0.1); }
+.comment-reply-button { font-size: smaller; min-height: 0; padding: 2px 8px; }
 .comment-editor { border-radius: 6px; border: 1px solid alpha(currentColor, 0.2); min-height: 60px; }
 .comment-badge { font-size: smaller; font-weight: bold; border-radius: 4px; padding: 0 5px; }
 .comment-badge.warning { color: @warning_color; background: alpha(@warning_color, 0.15); }

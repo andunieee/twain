@@ -3,13 +3,14 @@
 //! Comments live in one SQLite database (`$XDG_DATA_HOME/twain/comments.db`, the host's one
 //! also from Flatpak) that all twain processes — windows and `twain comment` invocations —
 //! keep open at the same time, one row per comment keyed by repository root, repo-relative
-//! path and id, with the comment as JSON. Its locks are byte-range locks on the database
-//! files, which unlike LMDB's pid-keyed reader table work across Flatpak's pid namespaces.
+//! path and id, with the comment as JSON. Replies are in a table of their own, keyed by their
+//! comment's key and their own id. Its locks are byte-range locks on the database files,
+//! which unlike LMDB's pid-keyed reader table work across Flatpak's pid namespaces.
 //!
 //! After committing a write, a process sends the key it wrote,
 //!
 //! ```text
-//! <repo root> \0 <repo-relative path> \0 <id>
+//! <repo root> \0 <repo-relative path> \0 <comment id> [\0 <reply id>]
 //! ```
 //!
 //! as a datagram to every socket in
@@ -19,6 +20,7 @@
 //! dead processes are removed by the first sender that gets refused.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
 use std::os::unix::net::UnixDatagram;
@@ -65,6 +67,50 @@ pub struct Comment {
     /// after the file changes. Empty when unknown.
     #[serde(default)]
     pub lines: Vec<String>,
+}
+
+/// A reply in a comment's thread. Replies have no lines of their own: they're shown wherever
+/// their comment is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reply {
+    pub id: String,
+    /// Repository-relative path of the comment's file.
+    pub path: String,
+    /// Id of the comment replied to.
+    pub comment: String,
+    pub body: String,
+    pub author: String,
+    /// Unix timestamps in seconds.
+    pub created: i64,
+    pub updated: i64,
+}
+
+impl Reply {
+    pub fn new(comment: &Comment, body: &str, author: &str) -> Reply {
+        let now = now();
+        Reply {
+            id: String::new(),
+            path: comment.path.clone(),
+            comment: comment.id.clone(),
+            body: body.to_string(),
+            author: author.to_string(),
+            created: now,
+            updated: now,
+        }
+    }
+}
+
+/// A comment and its replies, oldest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Thread {
+    pub comment: Comment,
+    pub replies: Vec<Reply>,
+}
+
+/// A comment or a reply, as found by id.
+pub enum Item {
+    Comment(Comment),
+    Reply(Reply),
 }
 
 /// Where a comment's lines are in the current text of its file.
@@ -222,16 +268,20 @@ fn socket_addr(dir: &Path, name: &str) -> io::Result<(PathBuf, Option<std::fs::F
 pub struct Key {
     pub root: String,
     pub path: String,
+    /// The comment's id, also for keys of its replies.
     pub id: String,
+    pub reply: Option<String>,
 }
 
 impl Key {
-    pub fn encode(root: &str, path: &str, id: &str) -> Vec<u8> {
-        [root.as_bytes(), path.as_bytes(), id.as_bytes()].join(&0u8)
+    pub fn encode(root: &str, path: &str, id: &str, reply: Option<&str>) -> Vec<u8> {
+        let mut parts = vec![root.as_bytes(), path.as_bytes(), id.as_bytes()];
+        parts.extend(reply.map(str::as_bytes));
+        parts.join(&0u8)
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Key> {
-        let mut parts = bytes.splitn(3, |&b| b == 0);
+        let mut parts = bytes.splitn(4, |&b| b == 0);
         let mut next = || {
             parts
                 .next()
@@ -241,6 +291,7 @@ impl Key {
             root: next()?,
             path: next()?,
             id: next()?,
+            reply: next(),
         })
     }
 }
@@ -279,7 +330,15 @@ impl Store {
                 id TEXT NOT NULL,
                 comment TEXT NOT NULL,
                 PRIMARY KEY (root, path, id)
-            ) WITHOUT ROWID",
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS replies (
+                root TEXT NOT NULL,
+                path TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                id TEXT NOT NULL,
+                reply TEXT NOT NULL,
+                PRIMARY KEY (root, path, comment, id)
+            ) WITHOUT ROWID;",
         )
         .map_err(db_err)?;
         Ok(Store {
@@ -329,21 +388,114 @@ impl Store {
         Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
     }
 
-    /// Finds a comment of the repository by id, or by an unambiguous id prefix.
-    pub fn find(&self, root: &str, id: &str) -> Result<Comment, String> {
-        let mut found: Vec<Comment> = self
+    /// Replies of a repository, or of one file in it, ordered by comment, then age.
+    pub fn list_replies(&self, root: &str, path: Option<&str>) -> Result<Vec<Reply>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT reply FROM replies WHERE root = ?1 AND (?2 IS NULL OR path = ?2)",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map((root, path), |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for value in rows {
+            match serde_json::from_str::<Reply>(&value.map_err(db_err)?) {
+                Ok(r) => out.push(r),
+                Err(e) => eprintln!("twain: skipping unreadable reply: {e}"),
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.path, &a.comment, a.created, &a.id).cmp(&(&b.path, &b.comment, b.created, &b.id))
+        });
+        Ok(out)
+    }
+
+    /// Comments of a repository, or of one file in it, with their replies.
+    pub fn threads(&self, root: &str, path: Option<&str>) -> Result<Vec<Thread>, String> {
+        let mut replies: HashMap<(String, String), Vec<Reply>> = HashMap::new();
+        for r in self.list_replies(root, path)? {
+            replies
+                .entry((r.path.clone(), r.comment.clone()))
+                .or_default()
+                .push(r);
+        }
+        Ok(self
+            .list(root, path)?
+            .into_iter()
+            .map(|comment| Thread {
+                replies: replies
+                    .remove(&(comment.path.clone(), comment.id.clone()))
+                    .unwrap_or_default(),
+                comment,
+            })
+            .collect())
+    }
+
+    pub fn get_reply(
+        &self,
+        root: &str,
+        path: &str,
+        comment: &str,
+        id: &str,
+    ) -> Result<Option<Reply>, String> {
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT reply FROM replies
+                 WHERE root = ?1 AND path = ?2 AND comment = ?3 AND id = ?4",
+                (root, path, comment, id),
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
+    }
+
+    /// A comment and its replies.
+    pub fn thread(&self, root: &str, comment: Comment) -> Result<Thread, String> {
+        let replies = self
+            .list_replies(root, Some(&comment.path))?
+            .into_iter()
+            .filter(|r| r.comment == comment.id)
+            .collect();
+        Ok(Thread { comment, replies })
+    }
+
+    /// Finds a comment or reply of the repository by id, or by an unambiguous id prefix.
+    pub fn find(&self, root: &str, id: &str) -> Result<Item, String> {
+        let mut found: Vec<(String, Item)> = self
             .list(root, None)?
             .into_iter()
-            .filter(|c| c.id.starts_with(id))
+            .map(|c| (c.id.clone(), Item::Comment(c)))
+            .chain(
+                self.list_replies(root, None)?
+                    .into_iter()
+                    .map(|r| (r.id.clone(), Item::Reply(r))),
+            )
+            .filter(|(i, _)| i.starts_with(id))
             .collect();
+        if found.len() > 1 && found.iter().any(|(i, _)| i == id) {
+            found.retain(|(i, _)| i == id);
+        }
         match found.len() {
-            0 => Err(format!("no comment with id {id}")),
-            1 => Ok(found.pop().unwrap()),
-            _ if found.iter().any(|c| c.id == id) => {
-                Ok(found.into_iter().find(|c| c.id == id).unwrap())
-            }
+            0 => Err(format!("no comment or reply with id {id}")),
+            1 => Ok(found.pop().unwrap().1),
             _ => Err(format!("id {id} is ambiguous")),
         }
+    }
+
+    /// Finds the thread of a comment, or of a reply, by id or unambiguous id prefix.
+    pub fn find_thread(&self, root: &str, id: &str) -> Result<Thread, String> {
+        let comment = match self.find(root, id)? {
+            Item::Comment(c) => c,
+            Item::Reply(r) => self
+                .get(root, &r.path, &r.comment)?
+                .ok_or_else(|| format!("the comment of reply {id} is gone"))?,
+        };
+        self.thread(root, comment)
     }
 
     /// Inserts or replaces comments, giving a fresh id to those without one, and notifies the
@@ -378,7 +530,7 @@ impl Store {
                 (root, &comment.path, &comment.id, &value),
             )
             .map_err(db_err)?;
-            keys.push(Key::encode(root, &comment.path, &comment.id));
+            keys.push(Key::encode(root, &comment.path, &comment.id, None));
         }
         tx.commit().map_err(db_err)?;
         drop(conn);
@@ -386,11 +538,71 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes comments and notifies the other processes.
-    pub fn delete(&self, root: &str, comments: &[Comment]) -> Result<(), String> {
+    /// Inserts or replaces replies, giving a fresh id to those without one, and notifies the
+    /// other processes. Fails if a reply's comment is gone.
+    pub fn put_replies(&self, root: &str, replies: &mut [Reply]) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        let mut keys = Vec::new();
+        for reply in replies.iter_mut() {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM comments
+                     WHERE root = ?1 AND path = ?2 AND id = ?3)",
+                    (root, &reply.path, &reply.comment),
+                    |row| row.get(0),
+                )
+                .map_err(db_err)?;
+            if !exists {
+                return Err(format!("comment {} no longer exists", reply.comment));
+            }
+            if reply.id.is_empty() {
+                // Unique in the repository, among comments too, so that ids rarely need more
+                // than their prefix to be found.
+                reply.id = loop {
+                    let id = new_id();
+                    let taken: bool = tx
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM replies WHERE root = ?1 AND id = ?2)
+                             OR EXISTS (SELECT 1 FROM comments WHERE root = ?1 AND id = ?2)",
+                            (root, &id),
+                            |row| row.get(0),
+                        )
+                        .map_err(db_err)?;
+                    if !taken {
+                        break id;
+                    }
+                };
+            }
+            let value = serde_json::to_string(reply).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO replies (root, path, comment, id, reply)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (root, &reply.path, &reply.comment, &reply.id, &value),
+            )
+            .map_err(db_err)?;
+            keys.push(Key::encode(
+                root,
+                &reply.path,
+                &reply.comment,
+                Some(&reply.id),
+            ));
+        }
+        tx.commit().map_err(db_err)?;
+        drop(conn);
+        notify(&keys);
+        Ok(())
+    }
+
+    /// Deletes comments with their replies, and notifies the other processes. Returns how
+    /// many replies went with them.
+    pub fn delete(&self, root: &str, comments: &[Comment]) -> Result<usize, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(db_err)?;
         let mut keys = Vec::new();
+        let mut deleted_replies = 0;
         for c in comments {
             let n = tx
                 .execute(
@@ -399,7 +611,45 @@ impl Store {
                 )
                 .map_err(db_err)?;
             if n > 0 {
-                keys.push(Key::encode(root, &c.path, &c.id));
+                keys.push(Key::encode(root, &c.path, &c.id, None));
+            }
+            let mut stmt = tx
+                .prepare_cached(
+                    "DELETE FROM replies WHERE root = ?1 AND path = ?2 AND comment = ?3
+                     RETURNING id",
+                )
+                .map_err(db_err)?;
+            let replies = stmt
+                .query_map((root, &c.path, &c.id), |row| row.get::<_, String>(0))
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            drop(stmt);
+            deleted_replies += replies.len();
+            for r in &replies {
+                keys.push(Key::encode(root, &c.path, &c.id, Some(r)));
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        drop(conn);
+        notify(&keys);
+        Ok(deleted_replies)
+    }
+
+    /// Deletes replies and notifies the other processes.
+    pub fn delete_replies(&self, root: &str, replies: &[Reply]) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db_err)?;
+        let mut keys = Vec::new();
+        for r in replies {
+            let n = tx
+                .execute(
+                    "DELETE FROM replies WHERE root = ?1 AND path = ?2 AND comment = ?3 AND id = ?4",
+                    (root, &r.path, &r.comment, &r.id),
+                )
+                .map_err(db_err)?;
+            if n > 0 {
+                keys.push(Key::encode(root, &r.path, &r.comment, Some(&r.id)));
             }
         }
         tx.commit().map_err(db_err)?;
@@ -541,11 +791,17 @@ mod tests {
 
     #[test]
     fn key_round_trip() {
-        let k = Key::encode("/repo", "src/a b.rs", "0123abcd");
+        let k = Key::encode("/repo", "src/a b.rs", "0123abcd", None);
         let d = Key::decode(&k).unwrap();
         assert_eq!(
-            (d.root.as_str(), d.path.as_str(), d.id.as_str()),
-            ("/repo", "src/a b.rs", "0123abcd")
+            (d.root.as_str(), d.path.as_str(), d.id.as_str(), d.reply),
+            ("/repo", "src/a b.rs", "0123abcd", None)
+        );
+        let k = Key::encode("/repo", "a", "0123abcd", Some("4567ef01"));
+        let d = Key::decode(&k).unwrap();
+        assert_eq!(
+            (d.id.as_str(), d.reply.as_deref()),
+            ("0123abcd", Some("4567ef01"))
         );
     }
 
