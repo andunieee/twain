@@ -68,6 +68,9 @@ impl Side {
         view.set_highlight_current_line(false);
         view.set_left_margin(6);
         view.set_right_margin(12);
+        // GtkSourceView puts "Change Case" items in the built-in menu, which still opens
+        // from the keyboard; they make no sense on read-only text.
+        view.set_extra_menu(None::<&gio::MenuModel>);
         view.add_css_class("diff-text");
 
         let scroller = gtk::ScrolledWindow::builder()
