@@ -1310,7 +1310,27 @@ impl Window {
             return;
         }
         let (w, scale) = (width as f64, height as f64 / total);
+        // Divider between one file's change marks and the next file's,
+        // in the middle of the gap between the two sections.
+        let fg = self.filemaps[side].color();
+        let (fr, fgc, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
+        let mut prev_bottom = f64::NAN;
         for f in self.files.borrow().iter() {
+            let section = f.section(side);
+            let top = match section.compute_point(&self.contents[side], &graphene::Point::zero()) {
+                Some(p) => p.y() as f64,
+                None => continue,
+            };
+            let bottom = top + section.height() as f64;
+            if prev_bottom.is_finite() {
+                let mid = ((prev_bottom + top) / 2.0 * scale).floor() + 0.5;
+                if mid > 0.5 && mid < height as f64 - 0.5 {
+                    cr.rectangle(0.0, mid, w, 1.0);
+                    cr.set_source_rgba(fr, fgc, fb, 0.35);
+                    let _ = cr.fill();
+                }
+            }
+            prev_bottom = bottom;
             let Some(body) = f.body_y(side, &self.contents[side]) else {
                 continue;
             };
