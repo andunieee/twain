@@ -221,6 +221,8 @@ impl Window {
                 .build(),
         );
         root_row.append(&unchanged_toggle());
+        // Tree rows use one too.
+        root_row.set_cursor_from_name(Some("pointer"));
         let tree_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&tree_view)
@@ -382,6 +384,37 @@ impl Window {
             }
             this.fill_tree();
         });
+
+        // Right click the top level folder name to hide or choose how much to show for all
+        // the files under it.
+        let click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .build();
+        let weak = Rc::downgrade(self);
+        click.connect_pressed(move |gesture, _, x, y| {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            let mut nodes = Vec::new();
+            let mut pos = 0;
+            // Top level rows hold the root's children, their nodes cover the whole tree.
+            while let Some(item) = this.tree_model.item(pos) {
+                if let Some(row) = item.downcast_ref::<gtk::TreeListRow>()
+                    .filter(|row| row.depth() == 0)
+                    .and_then(|row| node_of(row.upcast_ref()))
+                {
+                    nodes.push(row);
+                }
+                pos += 1;
+            }
+            let files = tree::file_order(&nodes);
+            if files.is_empty() {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            this.show_file_menu(files, this.root_row.upcast_ref::<gtk::Widget>(), x, y);
+        });
+        self.root_row.add_controller(click);
 
         let weak = Rc::downgrade(self);
         factory.connect_setup(move |_, item| {

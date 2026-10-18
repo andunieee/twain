@@ -1169,6 +1169,9 @@ impl FileView {
             let (Some(view), Some(this)) = (view.upgrade(), weak.upgrade()) else {
                 return;
             };
+            // Always keep the built-in menu from opening: without a claim it does even here,
+            // with its editing entries, when parts of a line without text are clicked.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
             let (bx, by) =
                 view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
             let Some(iter) = view.iter_at_location(bx, by) else {
@@ -1181,7 +1184,6 @@ impl FileView {
             if !inside {
                 buffer.place_cursor(&iter);
             }
-            gesture.set_state(gtk::EventSequenceState::Claimed);
             let menu = gio::Menu::new();
             let section = gio::Menu::new();
             section.append(Some("Copy"), Some("clipboard.copy"));
