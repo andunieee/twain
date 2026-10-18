@@ -311,6 +311,7 @@ impl Window {
             on_line_height: RefCell::default(),
             on_relayout: RefCell::default(),
             on_reload: RefCell::default(),
+            on_staged: RefCell::default(),
             root: RefCell::default(),
             author: glib::user_name().to_string_lossy().into_owned(),
         });
@@ -665,6 +666,12 @@ impl Window {
             }
         }));
         let weak = Rc::downgrade(self);
+        *self.shared.on_staged.borrow_mut() = Some(Box::new(move |path| {
+            if let Some(this) = weak.upgrade() {
+                this.sync_staged(path);
+            }
+        }));
+        let weak = Rc::downgrade(self);
         *self.shared.on_relayout.borrow_mut() = Some(Box::new(move || {
             if let Some(this) = weak.upgrade() {
                 this.queue_sync();
@@ -857,8 +864,8 @@ impl Window {
                     .old_path
                     .as_ref()
                     .is_some_and(|p| git::in_focus(&cmp.focus, p));
-            let fold = folded.contains(&change.path)
-                || (unfocused && !known.contains(&change.path));
+            let fold =
+                folded.contains(&change.path) || (unfocused && !known.contains(&change.path));
             let fv = FileView::new(change, self.shared.clone(), !full);
             fv.set_folded(fold);
             if !fold && eager_height < 2000 && scroll == 0.0 {
@@ -920,7 +927,11 @@ impl Window {
         let scroll = adj.value();
 
         let paths = self.tree_paths.borrow();
-        let changed: Vec<_> = paths.0.iter().map(|(p, s, st)| (p.as_str(), *s, *st)).collect();
+        let changed: Vec<_> = paths
+            .0
+            .iter()
+            .map(|(p, s, st)| (p.as_str(), *s, *st))
+            .collect();
         let unchanged: Vec<_> = paths.1.iter().map(String::as_str).collect();
         let root = tree::build(&changed, &unchanged, &self.unchanged_shown.borrow());
         let label = self.root_row.first_child().unwrap().next_sibling().unwrap();
@@ -946,7 +957,9 @@ impl Window {
                     .get(path)
                     .copied()
                     .unwrap_or(n.changed || n.unchanged_shown == Some(true));
-                row.downcast::<gtk::TreeListRow>().unwrap().set_expanded(expand);
+                row.downcast::<gtk::TreeListRow>()
+                    .unwrap()
+                    .set_expanded(expand);
             }
             pos += 1;
         }
@@ -959,6 +972,24 @@ impl Window {
         });
         self.synced_file.set(None);
         self.sync_sidebar();
+    }
+
+    /// One file's index changed in place (a stage or unstage): refresh just its sidebar row.
+    fn sync_staged(self: &Rc<Self>, path: &str) {
+        let (status, staging) = {
+            let files = self.files.borrow();
+            let Some(f) = files.iter().find(|f| f.change.path == path) else {
+                return;
+            };
+            f.staging_state()
+        };
+        {
+            let mut paths = self.tree_paths.borrow_mut();
+            if let Some(i) = paths.0.iter().position(|(p, _, _)| p == path) {
+                paths.0[i] = (path.to_string(), status, staging);
+            }
+        }
+        self.fill_tree();
     }
 
     /// Shows or hides the unchanged files of a directory. Showing them shows those of all
@@ -1113,7 +1144,11 @@ impl Window {
         );
         if has_texts {
             menu.append(
-                Some(if many { "Show Full Files" } else { "Show Full File" }),
+                Some(if many {
+                    "Show Full Files"
+                } else {
+                    "Show Full File"
+                }),
                 Some("file.mode::full"),
             );
             menu.append(Some("Show Changes Only"), Some("file.mode::changes"));
@@ -1198,7 +1233,9 @@ impl Window {
         let y = src.value() + src.page_size() * point;
         let other = diff::map_y(&self.anchors(), master, y);
         let max = (dst.upper() - dst.page_size()).max(dst.lower());
-        let value = (other - dst.page_size() * point).clamp(dst.lower(), max).floor();
+        let value = (other - dst.page_size() * point)
+            .clamp(dst.lower(), max)
+            .floor();
         self.scroll_lock.set(true);
         dst.set_value(value);
         self.scroll_lock.set(false);
@@ -1237,8 +1274,7 @@ impl Window {
             let mut bottoms = [0.0; 2];
             for s in 0..2 {
                 let section = f.section(s);
-                let Some(p) =
-                    section.compute_point(&self.contents[s], &graphene::Point::zero())
+                let Some(p) = section.compute_point(&self.contents[s], &graphene::Point::zero())
                 else {
                     continue;
                 };
@@ -1324,8 +1360,7 @@ impl Window {
             );
             for f in self.files.borrow().iter() {
                 let section = f.section(side);
-                let Some(p) =
-                    section.compute_point(&self.contents[side], &graphene::Point::zero())
+                let Some(p) = section.compute_point(&self.contents[side], &graphene::Point::zero())
                 else {
                     continue;
                 };
@@ -1437,7 +1472,10 @@ impl Window {
         let files = self.files.borrow();
         let fv = &files[m.file];
         let y = fv.layout.borrow().line_y(m.side, m.line);
-        Some((m.side, fv.body_y(m.side, &self.contents[m.side])? + y as f64))
+        Some((
+            m.side,
+            fv.body_y(m.side, &self.contents[m.side])? + y as f64,
+        ))
     }
 
     /// Whether a match is below the top of the view of its column.

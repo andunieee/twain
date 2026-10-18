@@ -65,7 +65,7 @@ enum NewSide {
     Rev(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     Text(String),
     Binary,
@@ -128,6 +128,21 @@ impl Staging {
     }
 }
 
+/// How much of one file's change is staged, judging by its three contents. Equal contents
+/// stand in for the repository-wide staged/unstaged queries of `load`: after one file's
+/// index entry was written from `revise`, the texts know the answer with two comparisons.
+/// Note that a content filter (autocrlf and the like) can make the worktree text differ
+/// from its index blob even where nothing real changed.
+pub fn staging_of(old: &Content, index: &Content, new: &Content) -> Staging {
+    if *index == *new {
+        Staging::Staged
+    } else if *index == *old {
+        Staging::Unstaged
+    } else {
+        Staging::Partly
+    }
+}
+
 pub struct Comparison {
     pub root: PathBuf,
     /// Human readable description, e.g. "HEAD → working tree".
@@ -143,7 +158,11 @@ pub struct Comparison {
 /// Whether `path` is one of `focus` or under one of them.
 pub fn in_focus(focus: &[String], path: &str) -> bool {
     focus.iter().any(|f| {
-        f.is_empty() || path == f || path.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/'))
+        f.is_empty()
+            || path == f
+            || path
+                .strip_prefix(f.as_str())
+                .is_some_and(|r| r.starts_with('/'))
     })
 }
 
@@ -408,7 +427,11 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
 }
 
 fn is_commit(root: &Path, rev: &str) -> bool {
-    git(root, &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")]).is_ok()
+    git(
+        root,
+        &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")],
+    )
+    .is_ok()
 }
 
 /// Whether `arg` names a revision or a range of them (`a..b`, `a...b`, either side optional
@@ -424,7 +447,11 @@ fn is_rev(root: &Path, arg: &str) -> bool {
 /// Tells the revisions from the paths among the arguments, like git: without `--`, the
 /// leading arguments that are revisions are taken as such, and the rest must be existing
 /// paths. The paths are returned relative to the root.
-fn split_args(root: &Path, cwd: &Path, opts: &Options) -> Result<(Vec<String>, Vec<String>), String> {
+fn split_args(
+    root: &Path,
+    cwd: &Path,
+    opts: &Options,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let (revs, paths) = if opts.dashdash {
         (opts.args.clone(), opts.paths.clone())
     } else {
@@ -464,13 +491,13 @@ fn repo_path(root: &Path, prefix: &str, arg: &str) -> Result<String, String> {
     let outside = || format!("{arg}: outside the repository");
     let joined = if Path::new(arg).is_absolute() {
         let abs = Path::new(arg);
-        let rel = abs
-            .strip_prefix(root)
-            .map(Path::to_path_buf)
-            .or_else(|_| {
-                let canon = std::fs::canonicalize(abs).map_err(|_| outside())?;
-                canon.strip_prefix(root).map(Path::to_path_buf).map_err(|_| outside())
-            })?;
+        let rel = abs.strip_prefix(root).map(Path::to_path_buf).or_else(|_| {
+            let canon = std::fs::canonicalize(abs).map_err(|_| outside())?;
+            canon
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .map_err(|_| outside())
+        })?;
         rel.to_string_lossy().into_owned()
     } else {
         format!("{prefix}{arg}")
@@ -561,6 +588,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staging_of_walks_the_transitions() {
+        let (old, new) = (
+            Content::Text("1\n2\n".into()),
+            Content::Text("1\nTWO\n3\n".into()),
+        );
+        // Nothing staged; then one line; then fully staged.
+        assert_eq!(staging_of(&old, &old, &new), Staging::Unstaged);
+        assert_eq!(
+            staging_of(&old, &Content::Text("1\nTWO\n2\n".into()), &new),
+            Staging::Partly
+        );
+        assert_eq!(staging_of(&old, &new, &new), Staging::Staged);
+
+        // Added file: absent from the index is unstaged, then staged.
+        let (old, new) = (Content::Missing, Content::Text("n\n".into()));
+        assert_eq!(staging_of(&old, &Content::Missing, &new), Staging::Unstaged);
+        assert_eq!(staging_of(&old, &new, &new), Staging::Staged);
+
+        // Deleted file: the index keeping the content is unstaged; empty index is staged.
+        let (old, new) = (Content::Text("n\n".into()), Content::Missing);
+        assert_eq!(staging_of(&old, &old, &new), Staging::Unstaged);
+        assert_eq!(staging_of(&old, &Content::Missing, &new), Staging::Staged);
+    }
+
+    #[test]
+    fn missing_is_not_empty_text() {
+        // `staging_of` relies on an empty blob differing from an absent file.
+        assert_ne!(Content::Missing, Content::Text(String::new()));
+    }
+
+    #[test]
     fn revisions_and_paths() {
         let root = std::env::temp_dir().join(format!("twain-args-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -568,7 +626,15 @@ mod tests {
         let run = |args: &[&str]| git_str(&root, args).unwrap();
         let commit = |m: &str| {
             run(&["add", "."]);
-            run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", m]);
+            run(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                m,
+            ]);
         };
         run(&["init", "-q"]);
         std::fs::write(root.join("a"), "1\n").unwrap();
@@ -587,16 +653,16 @@ mod tests {
         };
         let none: Vec<String> = Vec::new();
         assert_eq!(load(&["HEAD"]).unwrap(), (vec!["a".into()], none.clone()));
-        assert_eq!(load(&["HEAD~1"]).unwrap(), (vec!["d/b".into()], none.clone()));
+        assert_eq!(
+            load(&["HEAD~1"]).unwrap(),
+            (vec!["d/b".into()], none.clone())
+        );
         assert_eq!(load(&["HEAD~2"]).unwrap(), (vec!["a".into()], none.clone()));
         assert_eq!(
             load(&["HEAD~2..HEAD"]).unwrap(),
             (vec!["a".into(), "d/b".into()], none.clone())
         );
-        assert_eq!(
-            load(&["HEAD~2..", "d"]).unwrap().1,
-            vec!["d".to_string()]
-        );
+        assert_eq!(load(&["HEAD~2..", "d"]).unwrap().1, vec!["d".to_string()]);
         assert_eq!(
             load(&["HEAD~2", "HEAD", "--", "gone", "./d/b"]).unwrap().1,
             vec!["gone".to_string(), "d/b".to_string()]
@@ -628,7 +694,15 @@ mod tests {
         std::fs::write(root.join("a"), "1\n2\n3\n").unwrap();
         std::fs::write(root.join("gone"), "x\n").unwrap();
         run(&["add", "."]);
-        run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
         let staged = || run(&["diff", "--cached", "--name-status"]);
 
         set_index(&root, "a", Some("1\nTWO\n3\n")).unwrap();

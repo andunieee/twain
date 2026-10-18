@@ -39,7 +39,11 @@ struct Ctx<'a> {
 /// "" for the top level). Directories come before files and chains of single-child
 /// directories are merged ("src/ui" instead of "src" → "ui") unless the outer one is shown.
 /// Returns the top level as a directory node with an empty name.
-pub fn build(paths: &[(&str, char, Option<Staging>)], unchanged: &[&str], shown: &HashSet<String>) -> Node {
+pub fn build(
+    paths: &[(&str, char, Option<Staging>)],
+    unchanged: &[&str],
+    shown: &HashSet<String>,
+) -> Node {
     let mut root = Dir::default();
     let mut changed_dirs = HashSet::new();
     for (i, &(path, status, staging)) in paths.iter().enumerate() {

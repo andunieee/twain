@@ -94,12 +94,7 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<Block> {
 
 /// The lines of the changes in `blocks` (old → new) whose change is already in `index`:
 /// on the old side, the lines `index` no longer has; on the new side, the ones it already has.
-pub fn staged_lines(
-    blocks: &[Block],
-    old: &str,
-    index: &str,
-    new: &str,
-) -> [Vec<Range<usize>>; 2] {
+pub fn staged_lines(blocks: &[Block], old: &str, index: &str, new: &str) -> [Vec<Range<usize>>; 2] {
     let changed = |blocks: &[Block], side: usize| -> Vec<Range<usize>> {
         blocks
             .iter()
@@ -613,7 +608,10 @@ mod tests {
         assert_eq!(o, vec![1..2]);
         assert_eq!(n, vec![1..2, 4..5]);
         // Nothing staged.
-        assert_eq!(staged_lines(&blocks, old, old, new), [vec![], Vec::<Range<usize>>::new()]);
+        assert_eq!(
+            staged_lines(&blocks, old, old, new),
+            [vec![], Vec::<Range<usize>>::new()]
+        );
         // Everything staged.
         let [o, n] = staged_lines(&blocks, old, new, new);
         assert_eq!((o, n), (vec![1..2, 3..4], vec![1..2, 4..6]));

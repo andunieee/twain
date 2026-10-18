@@ -9,7 +9,7 @@
 use crate::comment_card::{Action, Card, Target};
 use crate::comments::{self, Comment, Location, Reply, Side as CommentSide, Thread};
 use crate::diff::{self, Block, ChunkKind, Gap, Layout, Note};
-use crate::git::{Content, FileChange, Staging};
+use crate::git::{Content, FileChange, Staging, staging_of};
 use gtk::prelude::*;
 use gtk::{cairo, gdk, gio, glib, graphene};
 use sourceview5::prelude::*;
@@ -159,6 +159,9 @@ pub struct Hit {
     pub cols: std::ops::Range<usize>,
 }
 
+/// Called with the path of the file whose index state changed in place.
+pub type OnStaged = Box<dyn Fn(&str)>;
+
 /// State shared by all file views of a window.
 pub struct Shared {
     /// Measured height of a text line, 0 until the first view is realized.
@@ -171,6 +174,9 @@ pub struct Shared {
     pub on_relayout: RefCell<Option<Box<dyn Fn()>>>,
     /// Reloads the comparison, after the index changes.
     pub on_reload: RefCell<Option<Box<dyn Fn()>>>,
+    /// Called with a path when that file's index state changed in place (stage or unstage
+    /// of one of its changes), for the sidebar alone.
+    pub on_staged: RefCell<Option<OnStaged>>,
     /// Repository root, as comments are keyed by it.
     pub root: RefCell<String>,
     /// Author of comments written in this window.
@@ -187,6 +193,8 @@ struct Half {
     fold: gtk::Image,
     toggle_label: gtk::Label,
     comment_count: gtk::Label,
+    /// The status badge, restyled in place as staging changes.
+    status: gtk::Label,
     /// Width the cards were last measured for.
     width: Cell<i32>,
 }
@@ -263,6 +271,7 @@ impl Half {
             fold,
             toggle_label,
             comment_count,
+            status,
             width: Cell::new(0),
         }
     }
@@ -270,11 +279,33 @@ impl Half {
     fn header(&self) -> gtk::Button {
         self.widget.first_child().and_downcast().unwrap()
     }
+
+    /// Restyles the status badge in place, after staging changed.
+    fn set_state(&self, status: char, staging: Option<Staging>) {
+        self.status.set_label(&status.to_string());
+        style_status(&self.status, status, staging);
+    }
+}
+
+/// Everything about one `FileView` that staging can change after its construction.
+struct Volatile {
+    /// The file in the index, rewritten by every stage and unstage.
+    index: Option<Content>,
+    /// git status letter. Only the staging of an untracked file can change it.
+    status: char,
+    /// How much of the change is staged, when the new side is the working tree.
+    staging: Option<Staging>,
+    /// Changed lines on each side whose change is staged: on the old side, lines the index
+    /// no longer has; on the new side, the ones it already has.
+    staged: [Vec<std::ops::Range<usize>>; 2],
 }
 
 pub struct FileView {
     halves: [Half; 2],
     pub change: FileChange,
+    /// The parts of `change` that staging rewrites in place. The window reads the two
+    /// latter fields through `staging_state`.
+    vol: RefCell<Volatile>,
     shared: Rc<Shared>,
     /// Sanitized old/new text; `None` for binary files and files without content changes.
     texts: Option<[String; 2]>,
@@ -282,9 +313,6 @@ pub struct FileView {
     sides: OnceCell<[Side; 2]>,
     search_contexts: OnceCell<[sourceview5::SearchContext; 2]>,
     blocks: Vec<Block>,
-    /// Changed lines on each side whose change is staged: on the old side, lines the index
-    /// no longer has; on the new side, lines that are already in the index.
-    staged: [Vec<std::ops::Range<usize>>; 2],
     collapsed: Cell<bool>,
     /// Only the header is shown.
     folded: Cell<bool>,
@@ -323,6 +351,12 @@ impl FileView {
             }
             _ => Default::default(),
         };
+        let vol = Volatile {
+            index: change.index.clone(),
+            status: change.status,
+            staging: change.staging,
+            staged,
+        };
         let texts = (is_text && has_changes).then_some([old_text, new_text]);
         let message = match (&change.old, &change.new) {
             _ if texts.is_some() => None,
@@ -339,12 +373,12 @@ impl FileView {
         let this = Rc::new_cyclic(|weak_self| FileView {
             halves,
             change,
+            vol: RefCell::new(vol),
             shared,
             texts,
             sides: OnceCell::new(),
             search_contexts: OnceCell::new(),
             blocks,
-            staged,
             collapsed: Cell::new(collapsed),
             folded: Cell::new(false),
             revealed: RefCell::default(),
@@ -478,6 +512,12 @@ impl FileView {
 
     pub fn is_collapsed(&self) -> bool {
         self.collapsed.get()
+    }
+
+    /// The status letter and staging, as stage and unstage may have changed them.
+    pub fn staging_state(&self) -> (char, Option<Staging>) {
+        let v = self.vol.borrow();
+        (v.status, v.staging)
     }
 
     pub fn set_collapsed(&self, collapsed: bool) {
@@ -801,7 +841,8 @@ impl FileView {
                 .is_empty()
         };
         for half in &self.halves {
-            half.toggle_label.set_visible(can_hide && !self.folded.get());
+            half.toggle_label
+                .set_visible(can_hide && !self.folded.get());
             half.header().set_tooltip_text(
                 can_hide.then_some("Toggle between changes only and the full file"),
             );
@@ -844,7 +885,10 @@ impl FileView {
     /// Shows these comments, keeping any that are being edited as they are.
     pub fn set_comments(&self, list: Vec<Thread>) {
         for (side, half) in self.halves.iter().enumerate() {
-            let n = list.iter().filter(|t| t.comment.side.index() == side).count();
+            let n = list
+                .iter()
+                .filter(|t| t.comment.side.index() == side)
+                .count();
             half.comment_count
                 .set_label(&format!("{n} comment{}", if n == 1 { "" } else { "s" }));
             half.comment_count.set_visible(n > 0);
@@ -958,7 +1002,9 @@ impl FileView {
             .iter()
             .find(|(c, _)| c.comment.id == id)
             .map(|(c, _)| (c.comment.clone(), c.replies.clone()));
-        let Some((mut comment, replies)) = thread else { return };
+        let Some((mut comment, replies)) = thread else {
+            return;
+        };
         if matches!(action, Action::Save(..) | Action::Cancel)
             && let Some(sides) = self.sides()
         {
@@ -1161,12 +1207,18 @@ impl FileView {
                 })
             });
             let stage = chunk.flatten().map(|c| {
-                let staged = this.staged[i].iter().any(|r| r.contains(&line));
+                let staged = this.vol.borrow().staged[i]
+                    .iter()
+                    .any(|r| r.contains(&line));
                 (!staged, c)
             });
             if let Some((stage, _)) = &stage {
                 let section = gio::Menu::new();
-                let label = if *stage { "Stage Change" } else { "Unstage Change" };
+                let label = if *stage {
+                    "Stage Change"
+                } else {
+                    "Unstage Change"
+                };
                 section.append(Some(label), Some("side.stage"));
                 menu.append_section(None, &section);
             }
@@ -1204,16 +1256,19 @@ impl FileView {
         };
         self.texts.is_some()
             && c.old_path.is_none()
-            && c.index.as_ref().is_some_and(intact)
+            && self.vol.borrow().index.as_ref().is_some_and(intact)
             && intact(&c.old)
             && intact(&c.new)
     }
 
     /// Stages (copies to the index from the working tree) or unstages (copies from the old
-    /// side) the parts of a change that aren't already so, then reloads.
+    /// side) the parts of a change that aren't already so, then updates this file's state in
+    /// place and its sidebar row, without reloading anything else. F5 still comes back here.
     fn stage(&self, stage: bool, chunk: &diff::Chunk) {
         let c = &self.change;
-        let Some(index) = &c.index else { return };
+        let Some(index) = self.vol.borrow().index.clone() else {
+            return;
+        };
         let (target, range) = match stage {
             true => (&c.new, &chunk.new),
             false => (&c.old, &chunk.old),
@@ -1223,42 +1278,76 @@ impl FileView {
         let removed = text.is_empty() && matches!(target, Content::Missing);
         let root = std::path::PathBuf::from(&*self.shared.root.borrow());
         if let Err(err) = crate::git::set_index(&root, &c.path, (!removed).then_some(&text)) {
-            eprintln!("twain: could not update the index for {}: {err}", c.path);
+            return eprintln!("twain: could not update the index for {}: {err}", c.path);
         }
-        if let Some(f) = &*self.shared.on_reload.borrow() {
-            f();
+
+        // The texts didn't change and the index content is the one `revise` just wrote, so
+        // everything the ui shows of the staging follows without touching the repository.
+        let index = if removed {
+            Content::Missing
+        } else {
+            Content::Text(text.clone())
+        };
+        let mut v = self.vol.borrow_mut();
+        v.index = Some(index.clone());
+        // An entry vanishing from the index makes an added file untracked again; staging
+        // one makes an untracked file tracked.
+        match (v.status, removed) {
+            ('A', true) => v.status = '?',
+            ('?', false) => v.status = 'A',
+            _ => {}
+        }
+        v.staging = v
+            .staging
+            .is_some()
+            .then(|| staging_of(&c.old, &index, &c.new));
+        v.staged = match (&v.index, &self.texts) {
+            (Some(idx), Some([old_text, new_text])) if idx.is_text() => {
+                diff::staged_lines(&self.blocks, old_text, &diff::sanitize(&text), new_text)
+            }
+            _ => Default::default(),
+        };
+        let (status, staging) = (v.status, v.staging);
+        drop(v);
+        for half in &self.halves {
+            half.set_state(status, staging);
+            half.decorations.queue_draw();
+        }
+        if let Some(f) = &*self.shared.on_staged.borrow() {
+            f(&c.path);
         }
     }
 
     /// Says "Staged" over the hatched lines.
     fn setup_staged_tooltip(&self, i: usize, side: &Side) {
-        if self.staged[i].is_empty() {
-            return;
-        }
         side.view.set_has_tooltip(true);
         let weak = self.weak_self.clone();
-        side.view.connect_query_tooltip(move |view, x, y, keyboard, tooltip| {
-            let Some(this) = weak.upgrade() else {
-                return false;
-            };
-            if keyboard {
-                return false;
-            }
-            let (_, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x, y);
-            let (iter, _) = view.line_at_y(by);
-            let line = iter.line() as usize;
-            if !this.staged[i].iter().any(|r| r.contains(&line)) {
-                return false;
-            }
-            // Not over the space above the line, where comment cards and gap bands go.
-            let layout = this.layout.borrow();
-            let top = layout.line_y(i, line);
-            if by < top || by >= top + layout.line_height() {
-                return false;
-            }
-            tooltip.set_text(Some("Staged"));
-            true
-        });
+        side.view
+            .connect_query_tooltip(move |view, x, y, keyboard, tooltip| {
+                let Some(this) = weak.upgrade() else {
+                    return false;
+                };
+                if keyboard {
+                    return false;
+                }
+                let (_, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x, y);
+                let (iter, _) = view.line_at_y(by);
+                let line = iter.line() as usize;
+                if !this.vol.borrow().staged[i]
+                    .iter()
+                    .any(|r| r.contains(&line))
+                {
+                    return false;
+                }
+                // Not over the space above the line, where comment cards and gap bands go.
+                let layout = this.layout.borrow();
+                let top = layout.line_y(i, line);
+                if by < top || by >= top + layout.line_height() {
+                    return false;
+                }
+                tooltip.set_text(Some("Staged"));
+                true
+            });
     }
 
     fn side_width(&self, side: usize) -> i32 {
@@ -1406,7 +1495,7 @@ impl FileView {
         // Staged lines are hatched.
         let fg = area.color();
         let (r, g, b) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
-        for range in &self.staged[side] {
+        for range in &self.vol.borrow().staged[side] {
             cr.save().ok();
             for line in range.clone() {
                 cr.rectangle(0.0, layout.line_y(side, line) as f64, w, lh);
