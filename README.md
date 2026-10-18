@@ -29,7 +29,16 @@ Thins Meld has that we don't:
 
 ## Usage
 
-Run `twain` in your project's directory. It can also compare other Git revisions, but that doesn't matter much for now.
+Run `twain` in your project's directory to see your uncommitted changes. It can also show other Git revisions, with arguments like `git diff`'s:
+
+```
+twain HEAD~1                 # the changes made by a commit
+twain v1.0..main             # between two revisions
+twain src/main.rs            # only these files (the others stay in the sidebar, hidden)
+twain v1.0..main -- a.rs b.rs
+```
+
+See `twain --help` for more.
 
 ## Comments
 

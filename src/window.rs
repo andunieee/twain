@@ -817,6 +817,7 @@ impl Window {
         };
         let expanded = paths_where(|f| !f.is_collapsed());
         let folded = paths_where(|f| f.is_folded());
+        let known = paths_where(|_| true);
         drop(old_files);
 
         if cmp.files.is_empty() {
@@ -849,7 +850,15 @@ impl Window {
         let mut eager_height = 0;
         for change in changes {
             let full = expanded.contains(&change.path);
-            let fold = folded.contains(&change.path);
+            // Files outside the paths given on the command line start out hidden.
+            let unfocused = !cmp.focus.is_empty()
+                && !git::in_focus(&cmp.focus, &change.path)
+                && !change
+                    .old_path
+                    .as_ref()
+                    .is_some_and(|p| git::in_focus(&cmp.focus, p));
+            let fold = folded.contains(&change.path)
+                || (unfocused && !known.contains(&change.path));
             let fv = FileView::new(change, self.shared.clone(), !full);
             fv.set_folded(fold);
             if !fold && eager_height < 2000 && scroll == 0.0 {
@@ -1040,6 +1049,13 @@ impl Window {
             (mode, fs.iter().any(|f| f.has_texts()))
         };
         let many = files.len() > 1;
+        let others_hidden = {
+            let all = self.files.borrow();
+            all.iter()
+                .enumerate()
+                .any(|(i, f)| f.is_folded() && !files.contains(&i))
+        };
+        let these = files.clone();
         let action = gio::SimpleAction::new_stateful(
             "mode",
             Some(glib::VariantTy::STRING),
@@ -1068,6 +1084,28 @@ impl Window {
         let group = gio::SimpleActionGroup::new();
         group.add_action(&action);
 
+        let only = gio::SimpleAction::new("only", None);
+        let weak = Rc::downgrade(self);
+        only.connect_activate(move |_, _| {
+            let Some(this) = weak.upgrade() else { return };
+            let all: Vec<_> = this.files.borrow().clone();
+            for (i, f) in all.iter().enumerate() {
+                f.set_folded(!these.contains(&i));
+            }
+            this.scroll_to_file(these[0]);
+        });
+        group.add_action(&only);
+        let unhide = gio::SimpleAction::new("unhide", None);
+        let weak = Rc::downgrade(self);
+        unhide.connect_activate(move |_, _| {
+            let Some(this) = weak.upgrade() else { return };
+            let all: Vec<_> = this.files.borrow().clone();
+            for f in &all {
+                f.set_folded(false);
+            }
+        });
+        group.add_action(&unhide);
+
         let menu = gio::Menu::new();
         menu.append(
             Some(if many { "Hide All" } else { "Hide" }),
@@ -1085,6 +1123,20 @@ impl Window {
                 Some("file.mode::changes"),
             );
         }
+
+        let section = gio::Menu::new();
+        section.append(
+            Some(if many {
+                "Show Only These Files"
+            } else {
+                "Show Only This File"
+            }),
+            Some("file.only"),
+        );
+        if others_hidden {
+            section.append(Some("Show All Files"), Some("file.unhide"));
+        }
+        menu.append_section(None, &section);
 
         parent.insert_action_group("file", Some(&group));
         let popover = gtk::PopoverMenu::from_model(Some(&menu));

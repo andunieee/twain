@@ -12,17 +12,26 @@ const MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
 pub struct Options {
     pub dir: Option<PathBuf>,
     pub staged: bool,
-    pub revs: Vec<String>,
+    /// Arguments before `--` (or all of them, when there's no `--`): revisions, or else
+    /// paths, told apart once the repository is known.
+    pub args: Vec<String>,
+    /// Paths after `--`.
+    pub paths: Vec<String>,
+    /// Whether `--` was given, making every argument before it a revision.
+    pub dashdash: bool,
 }
 
 pub const USAGE: &str = "\
-usage: twain [-C <dir>] [--staged] [<rev> [<rev>]]
+usage: twain [-C <dir>] [--staged] [<rev> [<rev>]] [--] [<path>...]
        twain comment <command> ...   (see twain comment --help)
 
   twain                 HEAD vs working tree (staged + unstaged + untracked)
   twain --staged        HEAD vs index
-  twain <rev>           <rev> vs working tree
-  twain <a> <b>         <a> vs <b>   (also accepts <a>..<b> and <a>...<b>)";
+  twain <rev>           the changes made by commit <rev>
+  twain --staged <rev>  <rev> vs index
+  twain <a>..<b>        <a> vs <b>   (also <a> <b>, and <a>...<b> for merge-base vs <b>)
+
+  Given paths, only the files under them are shown; the others are hidden.";
 
 impl Options {
     pub fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
@@ -30,14 +39,18 @@ impl Options {
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--" => {
+                    opts.dashdash = true;
+                    opts.paths.extend(args.by_ref());
+                }
                 "-h" | "--help" => return Err(String::new()),
                 "--staged" | "--cached" => opts.staged = true,
                 "-C" => opts.dir = Some(args.next().ok_or("-C needs a directory")?.into()),
                 s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
-                _ => opts.revs.push(arg),
+                _ => opts.args.push(arg),
             }
         }
-        if opts.revs.len() > 2 {
+        if opts.dashdash && opts.args.len() > 2 {
             return Err("at most two revisions can be given".into());
         }
         Ok(opts)
@@ -122,6 +135,16 @@ pub struct Comparison {
     pub files: Vec<FileChange>,
     /// Every other file on the new side, for showing the whole tree.
     pub unchanged: Vec<String>,
+    /// Paths given on the command line, relative to the root ("" for all of it): the files
+    /// outside them start out hidden. Empty when none were given.
+    pub focus: Vec<String>,
+}
+
+/// Whether `path` is one of `focus` or under one of them.
+pub fn in_focus(focus: &[String], path: &str) -> bool {
+    focus.iter().any(|f| {
+        f.is_empty() || path == f || path.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/'))
+    })
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -189,7 +212,12 @@ pub fn repo_root(dir: Option<&Path>) -> Result<PathBuf, String> {
 
 /// Resolves the options against the repository and loads every changed file.
 pub fn load(opts: &Options) -> Result<Comparison, String> {
-    let root = repo_root(opts.dir.as_deref())?;
+    let cwd = match &opts.dir {
+        Some(d) => d.clone(),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let root = repo_root(Some(&cwd))?;
+    let (revs, focus) = split_args(&root, &cwd, opts)?;
 
     let has_head = git(&root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
     let head = || {
@@ -205,7 +233,7 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         NewSide::WorkTree
     };
 
-    let (old_rev, new_side, old_label) = match opts.revs.as_slice() {
+    let (old_rev, new_side, old_label) = match revs.as_slice() {
         [] => (head(), default_new, head()),
         [r] if r.contains("...") => {
             let (a, b) = r.split_once("...").unwrap();
@@ -217,7 +245,17 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
             let (a, b) = r.split_once("..").unwrap();
             (or_head(a), NewSide::Rev(or_head(b)), or_head(a))
         }
-        [r] => (r.clone(), default_new, r.clone()),
+        [r] if opts.staged => (r.clone(), NewSide::Index, r.clone()),
+        // A single commit: the changes it made, against its (first) parent.
+        [r] => {
+            let parent = format!("{r}^");
+            let base = if is_commit(&root, &parent) {
+                parent
+            } else {
+                EMPTY_TREE.to_string()
+            };
+            (base.clone(), NewSide::Rev(r.clone()), base)
+        }
         [a, b] => (a.clone(), NewSide::Rev(b.clone()), a.clone()),
         _ => unreachable!(),
     };
@@ -365,7 +403,89 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         root,
         files,
         unchanged,
+        focus,
     })
+}
+
+fn is_commit(root: &Path, rev: &str) -> bool {
+    git(root, &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")]).is_ok()
+}
+
+/// Whether `arg` names a revision or a range of them (`a..b`, `a...b`, either side optional
+/// but not both).
+fn is_rev(root: &Path, arg: &str) -> bool {
+    match arg.split_once("...").or_else(|| arg.split_once("..")) {
+        Some(("", "")) => false,
+        Some((a, b)) => [a, b].iter().all(|r| r.is_empty() || is_commit(root, r)),
+        None => is_commit(root, arg),
+    }
+}
+
+/// Tells the revisions from the paths among the arguments, like git: without `--`, the
+/// leading arguments that are revisions are taken as such, and the rest must be existing
+/// paths. The paths are returned relative to the root.
+fn split_args(root: &Path, cwd: &Path, opts: &Options) -> Result<(Vec<String>, Vec<String>), String> {
+    let (revs, paths) = if opts.dashdash {
+        (opts.args.clone(), opts.paths.clone())
+    } else {
+        let mut revs = Vec::new();
+        let mut paths = Vec::new();
+        for arg in &opts.args {
+            if paths.is_empty() && is_rev(root, arg) {
+                revs.push(arg.clone());
+            } else if std::fs::symlink_metadata(cwd.join(arg)).is_ok() {
+                paths.push(arg.clone());
+            } else {
+                return Err(format!(
+                    "unknown revision or path not in the working tree: {arg}\n\
+                     (use '--' to separate paths from revisions)"
+                ));
+            }
+        }
+        (revs, paths)
+    };
+    if revs.len() > 2 {
+        return Err("at most two revisions can be given".into());
+    }
+    if paths.is_empty() {
+        return Ok((revs, paths));
+    }
+    let prefix = git_str(cwd, &["rev-parse", "--show-prefix"])?;
+    let paths = paths
+        .iter()
+        .map(|p| repo_path(root, &prefix, p))
+        .collect::<Result<_, _>>()?;
+    Ok((revs, paths))
+}
+
+/// A path given on the command line, relative to the root: from `prefix` (the current
+/// directory, relative to the root) when it's relative.
+fn repo_path(root: &Path, prefix: &str, arg: &str) -> Result<String, String> {
+    let outside = || format!("{arg}: outside the repository");
+    let joined = if Path::new(arg).is_absolute() {
+        let abs = Path::new(arg);
+        let rel = abs
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .or_else(|_| {
+                let canon = std::fs::canonicalize(abs).map_err(|_| outside())?;
+                canon.strip_prefix(root).map(Path::to_path_buf).map_err(|_| outside())
+            })?;
+        rel.to_string_lossy().into_owned()
+    } else {
+        format!("{prefix}{arg}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop().ok_or_else(outside)?;
+            }
+            _ => parts.push(part),
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 /// Sets the index entry of `path` to `text`, or removes it if `None`.
@@ -439,6 +559,64 @@ fn short(rev: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revisions_and_paths() {
+        let root = std::env::temp_dir().join(format!("twain-args-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        let run = |args: &[&str]| git_str(&root, args).unwrap();
+        let commit = |m: &str| {
+            run(&["add", "."]);
+            run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", m]);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(root.join("a"), "1\n").unwrap();
+        commit("one");
+        std::fs::write(root.join("d/b"), "2\n").unwrap();
+        commit("two");
+        std::fs::write(root.join("a"), "3\n").unwrap();
+        commit("three");
+        let load = |args: &[&str]| {
+            let mut opts = Options::parse(args.iter().map(|s| s.to_string())).unwrap();
+            opts.dir = Some(root.clone());
+            let cmp = super::load(&opts)?;
+            let mut paths: Vec<_> = cmp.files.into_iter().map(|f| f.path).collect();
+            paths.sort();
+            Ok::<_, String>((paths, cmp.focus))
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(load(&["HEAD"]).unwrap(), (vec!["a".into()], none.clone()));
+        assert_eq!(load(&["HEAD~1"]).unwrap(), (vec!["d/b".into()], none.clone()));
+        assert_eq!(load(&["HEAD~2"]).unwrap(), (vec!["a".into()], none.clone()));
+        assert_eq!(
+            load(&["HEAD~2..HEAD"]).unwrap(),
+            (vec!["a".into(), "d/b".into()], none.clone())
+        );
+        assert_eq!(
+            load(&["HEAD~2..", "d"]).unwrap().1,
+            vec!["d".to_string()]
+        );
+        assert_eq!(
+            load(&["HEAD~2", "HEAD", "--", "gone", "./d/b"]).unwrap().1,
+            vec!["gone".to_string(), "d/b".to_string()]
+        );
+        assert!(load(&["nonexistent"]).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repo_paths() {
+        let root = Path::new("/r");
+        assert_eq!(repo_path(root, "src/", "a.rs").unwrap(), "src/a.rs");
+        assert_eq!(repo_path(root, "src/", "../b/./c/").unwrap(), "b/c");
+        assert_eq!(repo_path(root, "src/", "..").unwrap(), "");
+        assert!(repo_path(root, "", "../x").is_err());
+        assert_eq!(repo_path(root, "src/", "/r/d/e").unwrap(), "d/e");
+        assert!(in_focus(&["src".into()], "src/a.rs"));
+        assert!(!in_focus(&["src".into()], "srcx/a.rs"));
+        assert!(in_focus(&["".into()], "a"));
+    }
 
     #[test]
     fn set_index_stages_and_unstages() {
