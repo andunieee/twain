@@ -2,7 +2,7 @@
 
 A diff viewer for people who love Meld, but wanted it to be slightly different.
 
-![twain showing a diff](screenshot.png)
+![](screenshot.png)
 
 Things that are like Meld:
 

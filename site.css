@@ -1,0 +1,90 @@
+:root {
+  --bg: #fafaf9;
+  --fg: #26252a;
+  --muted: #6b6a72;
+  --accent: #3584e4;
+  --card: #ffffff;
+  --border: #e4e2e0;
+  --code-bg: #f1efed;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1d1d20;
+    --fg: #e6e4e8;
+    --muted: #9a98a2;
+    --accent: #78aeed;
+    --card: #28282c;
+    --border: #38383d;
+    --code-bg: #2a2a2f;
+  }
+}
+
+html { background: var(--bg); }
+body {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 3.5rem 1.25rem 5rem;
+  color: var(--fg);
+  background: var(--bg);
+  font: 1.05rem/1.65 system-ui, -apple-system, "Segoe UI", Cantarell, sans-serif;
+}
+
+h1 {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0 0 0.4rem;
+  font-size: 2.8rem;
+  letter-spacing: -0.03em;
+}
+h1::before {
+  content: "";
+  width: 2.8rem;
+  height: 2.8rem;
+  background: url(io.github.andunieee.twain.svg) center / contain no-repeat;
+}
+header p, h1 + p {
+  margin-top: 0;
+  font-size: 1.25rem;
+  color: var(--muted);
+}
+
+h2 {
+  margin: 2.8rem 0 0.8rem;
+  padding-bottom: 0.3rem;
+  font-size: 1.45rem;
+  letter-spacing: -0.01em;
+  border-bottom: 1px solid var(--border);
+}
+
+a { color: var(--accent); text-underline-offset: 0.15em; }
+
+img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 1.5rem 0 2rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+}
+
+ul { padding-left: 1.3rem; }
+li { margin: 0.35rem 0; }
+li::marker { color: var(--accent); }
+
+code, pre { font: 0.9em ui-monospace, "JetBrains Mono", "Fira Code", monospace; }
+code {
+  padding: 0.12em 0.4em;
+  background: var(--code-bg);
+  border-radius: 5px;
+}
+pre {
+  overflow-x: auto;
+  padding: 1rem 1.2rem;
+  line-height: 1.5;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+pre code { padding: 0; background: none; }
