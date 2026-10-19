@@ -1078,8 +1078,9 @@ impl Window {
     }
 
     fn scroll_to_file(&self, i: usize) {
-        if let Some(y) = self.file_top(0, i) {
-            self.scroll_column(0, y);
+        // Scroll the current (right) column; the old one follows via the diff anchors.
+        if let Some(y) = self.file_top(1, i) {
+            self.scroll_column(1, y);
         }
     }
 
