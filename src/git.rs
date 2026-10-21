@@ -22,7 +22,7 @@ pub struct Options {
 }
 
 pub const USAGE: &str = "\
-usage: twain [-C <dir>] [--staged] [<rev> [<rev>]] [--] [<path>...]
+usage: twain [-C <dir>] [--staged] [--foreground] [<rev> [<rev>]] [--] [<path>...]
        twain comment <command> ...   (see twain comment --help)
 
   twain                 HEAD vs working tree (staged + unstaged + untracked)
@@ -30,6 +30,8 @@ usage: twain [-C <dir>] [--staged] [<rev> [<rev>]] [--] [<path>...]
   twain <rev>           the changes made by commit <rev>
   twain --staged <rev>  <rev> vs index
   twain <a>..<b>        <a> vs <b>   (also <a> <b>, and <a>...<b> for merge-base vs <b>)
+
+  Twain detaches from the terminal unless --foreground is given.
 
   Given paths, only the files under them are shown; the others are hidden.";
 

@@ -85,6 +85,26 @@ scrollbar.overlay-indicator:not(.hovering).vertical slider { min-height: 48px; }
 scrollbar.overlay-indicator:not(.hovering).horizontal slider { min-width: 48px; }
 "#;
 
+/// Re-run ourselves in the background, in its own process group and with
+/// stdio silenced, so the launching terminal is free again. Returns false if
+/// that failed, in which case we just keep running in the foreground.
+fn detach() -> bool {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    Command::new(exe)
+        .args(std::env::args().skip(1))
+        .arg("--foreground")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .is_ok()
+}
+
 fn main() -> glib::ExitCode {
     let mut args = std::env::args().skip(1).peekable();
     if args
@@ -93,6 +113,9 @@ fn main() -> glib::ExitCode {
     {
         return glib::ExitCode::from(cli::run(args) as u8);
     }
+    let args: Vec<String> = args.collect();
+    let foreground = args.iter().any(|a| a == "--foreground");
+    let args = args.into_iter().filter(|a| a != "--foreground");
     let opts = match git::Options::parse(args) {
         Ok(opts) => opts,
         Err(err) => {
@@ -107,6 +130,10 @@ fn main() -> glib::ExitCode {
             };
         }
     };
+
+    if !foreground && detach() {
+        return glib::ExitCode::SUCCESS;
+    }
 
     let app = adw::Application::builder()
         .application_id("io.github.andunieee.twain")
