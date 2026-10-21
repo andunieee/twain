@@ -9,6 +9,7 @@ use crate::comments::{self, Listener};
 use crate::diff;
 use crate::file_view::{self, FileView, Shared};
 use crate::git::{self, Options};
+use crate::state;
 use crate::tree::{self, Node};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, graphene};
@@ -412,7 +413,7 @@ impl Window {
                 return;
             }
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            this.show_file_menu(files, this.root_row.upcast_ref::<gtk::Widget>(), x, y);
+            this.show_file_menu(files, this.root_row.upcast_ref::<gtk::Widget>(), x, y, true);
         });
         self.root_row.add_controller(click);
 
@@ -484,7 +485,7 @@ impl Window {
                 }
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 if let Some(widget) = gesture.widget() {
-                    this.show_file_menu(files, &widget, x, y);
+                    this.show_file_menu(files, &widget, x, y, false);
                 }
             });
             hbox.add_controller(click);
@@ -885,11 +886,16 @@ impl Window {
             cmp.unchanged,
         );
 
+        let default_full = state::show_full_files();
         let mut files = Vec::with_capacity(changes.len());
         // Build the first screenful right away; the rest is built as it scrolls into view.
         let mut eager_height = 0;
         for change in changes {
-            let full = expanded.contains(&change.path);
+            let full = if known.contains(&change.path) {
+                expanded.contains(&change.path)
+            } else {
+                default_full
+            };
             // Files outside the paths given on the command line start out hidden.
             let unfocused = !cmp.focus.is_empty()
                 && !git::in_focus(&cmp.focus, &change.path)
@@ -1094,7 +1100,17 @@ impl Window {
 
     /// The sidebar's context menu for files (one, or those under a directory): hide them, or
     /// show them in full or as changes only.
-    fn show_file_menu(self: &Rc<Self>, files: Vec<usize>, parent: &gtk::Widget, x: f64, y: f64) {
+    ///
+    /// From a project's root folder, the choice of full files or changes only is also remembered
+    /// as the default for the next runs.
+    fn show_file_menu(
+        self: &Rc<Self>,
+        files: Vec<usize>,
+        parent: &gtk::Widget,
+        x: f64,
+        y: f64,
+        root: bool,
+    ) {
         let mode_of = |f: &FileView| match (f.is_folded(), f.is_collapsed()) {
             (true, _) => "hidden",
             (false, true) => "changes",
@@ -1133,6 +1149,9 @@ impl Window {
                 return;
             };
             action.set_state(&mode.to_variant());
+            if root && mode != "hidden" {
+                state::set_show_full_files(mode == "full");
+            }
             for &i in &files {
                 let Some(f) = this.files.borrow().get(i).cloned() else {
                     continue;

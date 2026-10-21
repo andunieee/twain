@@ -4,6 +4,7 @@ mod comments;
 mod diff;
 mod file_view;
 mod git;
+mod state;
 mod syntax;
 mod tree;
 mod window;
