@@ -1,6 +1,6 @@
 # twain
 
-A diff viewer for people who love Meld, but wanted it to be slightly different.
+A Linux-only diff viewer for people who love Meld, but wanted it to be slightly different.
 
 ![](screenshot.png)
 
