@@ -400,7 +400,8 @@ impl Window {
             let mut pos = 0;
             // Top level rows hold the root's children, their nodes cover the whole tree.
             while let Some(item) = this.tree_model.item(pos) {
-                if let Some(row) = item.downcast_ref::<gtk::TreeListRow>()
+                if let Some(row) = item
+                    .downcast_ref::<gtk::TreeListRow>()
                     .filter(|row| row.depth() == 0)
                     .and_then(|row| node_of(row.upcast_ref()))
                 {

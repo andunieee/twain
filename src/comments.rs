@@ -67,7 +67,24 @@ pub struct Comment {
     /// after the file changes. Empty when unknown.
     #[serde(default)]
     pub lines: Vec<String>,
+    /// Up to `CONTEXT` lines right before and after the commented ones, to tell apart places
+    /// where the same lines occur.
+    #[serde(default)]
+    pub before: Vec<String>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// Git blob id of the file's text on `side` when the comment was written: when it's still
+    /// the same, the lines are where they were. Unknown for older comments.
+    #[serde(default)]
+    pub blob: Option<String>,
+    /// The commit that was checked out when the comment was written, to follow the lines
+    /// through the changes made since.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
+
+/// How many lines of context are kept on each side of the commented lines.
+const CONTEXT: usize = 3;
 
 /// A reply in a comment's thread. Replies have no lines of their own: they're shown wherever
 /// their comment is.
@@ -120,6 +137,96 @@ pub struct Location {
     pub lines: Range<usize>,
     /// The lines no longer match what was commented on; `lines` is the original position.
     pub outdated: bool,
+    /// The file is not the one the comment was written on, but the lines were found in it.
+    pub changed: bool,
+}
+
+/// A hunk of a zero-context diff: `old_len` lines from `old_start` (1-based; for an empty
+/// range, the line after which the new lines come) became `new_len` lines from `new_start`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hunk {
+    pub old_start: usize,
+    pub old_len: usize,
+    pub new_start: usize,
+    pub new_len: usize,
+}
+
+/// Where the 1-based old line `l` is after the hunks, if it survived them.
+fn map_line(hunks: &[Hunk], l: usize) -> Option<usize> {
+    let mut delta = 0isize;
+    for h in hunks {
+        let first = if h.old_len == 0 {
+            h.old_start + 1
+        } else {
+            h.old_start
+        };
+        if first + h.old_len <= l {
+            delta += h.new_len as isize - h.old_len as isize;
+        } else if first <= l {
+            return None;
+        }
+    }
+    Some((l as isize + delta) as usize)
+}
+
+/// Where the 1-based old lines `start..=end` start after the hunks, if they were left whole.
+fn map_range(hunks: &[Hunk], start: usize, end: usize) -> Option<usize> {
+    let (s, e) = (map_line(hunks, start)?, map_line(hunks, end)?);
+    (s + end == e + start).then_some(s)
+}
+
+/// The id git gives a blob with this text.
+pub fn blob_oid(text: &str) -> String {
+    let mut data = format!("blob {}\0", text.len()).into_bytes();
+    data.extend_from_slice(text.as_bytes());
+    sha1(&data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, b) in chunk.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..20 => ((b & c) | (!b & d), 0x5A827999),
+                20..40 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..60 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (i, x) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
+    }
+    out
 }
 
 impl Comment {
@@ -133,12 +240,18 @@ impl Comment {
     ) -> Comment {
         let now = now();
         let file_lines = split_lines(text);
-        let snapshot = file_lines
-            .get(lines.clone())
-            .unwrap_or_default()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let owned = |r: Option<&[&str]>| -> Vec<String> {
+            r.unwrap_or_default()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        let snapshot = owned(file_lines.get(lines.clone()));
+        let before = owned(file_lines.get(lines.start.saturating_sub(CONTEXT)..lines.start));
+        let after = owned(
+            file_lines
+                .get(lines.end.min(file_lines.len())..(lines.end + CONTEXT).min(file_lines.len())),
+        );
         Comment {
             id: String::new(),
             path: path.to_string(),
@@ -151,12 +264,25 @@ impl Comment {
             updated: now,
             resolved: false,
             lines: snapshot,
+            before,
+            after,
+            blob: (!text.is_empty()).then(|| blob_oid(text)),
+            commit: None,
         }
     }
 
-    /// Finds the commented lines in `text`: where they were if they're still there, else the
-    /// nearest place they moved to, else the original position marked as outdated.
-    pub fn locate(&self, text: &str) -> Location {
+    /// Whether `locate` can use the hunks of the changes made since the comment was written.
+    pub fn wants_hunks(&self, blob: &str) -> bool {
+        self.side == Side::New && self.commit.is_some() && self.blob.as_deref() != Some(blob)
+    }
+
+    /// Finds the commented lines in `text`, whose blob id is `blob`. If the file is the one
+    /// the comment was written on they're where they were. Otherwise they're followed through
+    /// `hunks` (the changes since the comment's commit, if known), or else searched for, with
+    /// the surrounding lines deciding between places they occur at, and with one changed line
+    /// forgiven in long ranges. Failing all that, it's the original position, marked outdated.
+    /// Whitespace at the ends of lines is ignored.
+    pub fn locate(&self, text: &str, blob: &str, hunks: &[Hunk]) -> Location {
         let lines = split_lines(text);
         let n = lines.len();
         let start = (self.start.max(1) - 1).min(n.saturating_sub(1));
@@ -167,34 +293,71 @@ impl Comment {
             return Location {
                 lines: original,
                 outdated: false,
+                changed: false,
             };
         }
-        let matches_at = |i: usize| {
-            i + snap.len() <= n
-                && lines[i..i + snap.len()]
-                    .iter()
-                    .zip(snap)
-                    .all(|(a, b)| a == b)
+        let changed = self.blob.as_deref() != Some(blob);
+        let len = snap.len();
+        let eq = |a: &str, b: &str| a.trim() == b.trim();
+        let matches_at =
+            |i: usize| i + len <= n && lines[i..i + len].iter().zip(snap).all(|(a, b)| eq(a, b));
+        let found = |i: usize| Location {
+            lines: i..i + len,
+            outdated: false,
+            changed,
         };
         let want = self.start.max(1) - 1;
-        if matches_at(want) {
-            return Location {
-                lines: want..want + snap.len(),
-                outdated: false,
-            };
+        if !changed && matches_at(want) {
+            return found(want);
         }
-        match (0..n)
-            .filter(|&i| matches_at(i))
-            .min_by_key(|&i| i.abs_diff(want))
+        if changed
+            && let Some(s) = map_range(hunks, self.start.max(1), self.end.max(self.start))
+            && matches_at(s - 1)
         {
-            Some(i) => Location {
-                lines: i..i + snap.len(),
-                outdated: false,
-            },
-            None => Location {
-                lines: original,
-                outdated: true,
-            },
+            return found(s - 1);
+        }
+        let context = |i: usize| {
+            let before = self
+                .before
+                .iter()
+                .rev()
+                .zip(lines[..i].iter().rev())
+                .take_while(|(a, b)| eq(a, b))
+                .count();
+            let after = self
+                .after
+                .iter()
+                .zip(lines[(i + len).min(n)..].iter())
+                .take_while(|(a, b)| eq(a, b))
+                .count();
+            before + after
+        };
+        let nearest = |i: usize| std::cmp::Reverse(i.abs_diff(want));
+        if let Some(i) = (0..n)
+            .filter(|&i| matches_at(i))
+            .max_by_key(|&i| (context(i), nearest(i)))
+        {
+            return found(i);
+        }
+        if len >= 5 && n >= len {
+            let same = |i: usize| {
+                lines[i..i + len]
+                    .iter()
+                    .zip(snap)
+                    .filter(|(a, b)| eq(a, b))
+                    .count()
+            };
+            if let Some(i) = (0..=n - len)
+                .filter(|&i| same(i) * 5 >= len * 4)
+                .max_by_key(|&i| (same(i), context(i), nearest(i)))
+            {
+                return found(i);
+            }
+        }
+        Location {
+            lines: original,
+            outdated: true,
+            changed,
         }
     }
 }
@@ -805,37 +968,104 @@ mod tests {
         );
     }
 
+    fn locate(c: &Comment, text: &str, hunks: &[Hunk]) -> Location {
+        c.locate(text, &blob_oid(text), hunks)
+    }
+
+    fn loc(lines: Range<usize>, outdated: bool, changed: bool) -> Location {
+        Location {
+            lines,
+            outdated,
+            changed,
+        }
+    }
+
     #[test]
     fn locate_follows_moved_lines() {
         let c = comment(2, 3, &["b", "c"]);
-        assert_eq!(
-            c.locate("a\nb\nc\nd\n"),
-            Location {
-                lines: 1..3,
-                outdated: false
-            }
-        );
-        assert_eq!(
-            c.locate("x\ny\na\nb\nc\n"),
-            Location {
-                lines: 3..5,
-                outdated: false
-            }
-        );
-        assert_eq!(
-            c.locate("a\nB\nc\n"),
-            Location {
-                lines: 1..3,
-                outdated: true
-            }
-        );
+        assert_eq!(locate(&c, "a\nb\nc\nd\n", &[]), loc(1..3, false, true));
+        assert_eq!(locate(&c, "x\ny\na\nb\nc\n", &[]), loc(3..5, false, true));
+        assert_eq!(locate(&c, "a\nB\nc\n", &[]), loc(1..3, true, true));
         // Past the end of a file that shrank.
         assert_eq!(
-            comment(9, 9, &["z"]).locate("a\n"),
-            Location {
-                lines: 0..1,
-                outdated: true
-            }
+            locate(&comment(9, 9, &["z"]), "a\n", &[]),
+            loc(0..1, true, true)
+        );
+        // Whitespace at the ends of lines doesn't matter.
+        assert_eq!(locate(&c, "a\n b \nc\t\n", &[]), loc(1..3, false, true));
+    }
+
+    #[test]
+    fn locate_unchanged_file() {
+        let text = "a\nb\nc\nd\n";
+        let c = Comment::new("f", Side::New, 1..3, "", "", text);
+        assert_eq!(locate(&c, text, &[]), loc(1..3, false, false));
+    }
+
+    #[test]
+    fn locate_uses_context_between_duplicates() {
+        let c = Comment::new("f", Side::New, 4..5, "", "", "a\nb\nc\nd\n}\ne\nf\ng\n");
+        assert_eq!(c.lines, vec!["}"]);
+        // Two closing braces now; the one with the same surroundings is chosen even though
+        // the other is nearer.
+        let text = "}\nx\nx\nx\na\nb\nc\nd\n}\ne\nf\ng\n";
+        assert_eq!(locate(&c, text, &[]), loc(8..9, false, true));
+    }
+
+    #[test]
+    fn locate_forgives_one_changed_line() {
+        let c = Comment::new("f", Side::New, 0..5, "", "", "1\n2\n3\n4\n5\n");
+        assert_eq!(
+            locate(&c, "x\n1\n2\nthree\n4\n5\n", &[]),
+            loc(1..6, false, true)
+        );
+        assert_eq!(
+            locate(&c, "x\n1\ntwo\nthree\n4\n5\n", &[]),
+            loc(0..5, true, true)
+        );
+    }
+
+    #[test]
+    fn locate_follows_hunks() {
+        let old = "}\nx\n}\ny\n";
+        let mut c = Comment::new("f", Side::New, 2..3, "", "", old);
+        c.commit = Some("abc".into());
+        // A line inserted at the top: the brace at line 3 is now line 4, not the one at 1.
+        let text = "}\n}\nx\n}\ny\n";
+        let hunks = [Hunk {
+            old_start: 0,
+            old_len: 0,
+            new_start: 1,
+            new_len: 1,
+        }];
+        assert!(c.wants_hunks(&blob_oid(text)));
+        assert_eq!(locate(&c, text, &hunks), loc(3..4, false, true));
+    }
+
+    #[test]
+    fn maps_lines_through_hunks() {
+        let h = |old_start, old_len, new_start, new_len| Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+        };
+        let hunks = [h(2, 0, 3, 2), h(5, 2, 7, 1)];
+        assert_eq!(map_line(&hunks, 2), Some(2));
+        assert_eq!(map_line(&hunks, 3), Some(5));
+        assert_eq!(map_line(&hunks, 5), None);
+        assert_eq!(map_line(&hunks, 7), Some(8));
+        // An insertion inside the range splits it.
+        assert_eq!(map_range(&[h(3, 0, 4, 1)], 3, 5), None);
+        assert_eq!(map_range(&[h(1, 0, 2, 1)], 3, 5), Some(4));
+    }
+
+    #[test]
+    fn blob_ids_match_git() {
+        assert_eq!(blob_oid(""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+        assert_eq!(
+            blob_oid("hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 

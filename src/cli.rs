@@ -5,7 +5,7 @@ use crate::comments::{self, Comment, Item, Reply, Side, Store, Thread};
 use crate::git;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const USAGE: &str = "\
 usage: twain comment <command> [-C <dir>] [options]
@@ -229,7 +229,7 @@ impl Ctx {
                 let text = texts
                     .entry(t.comment.path.clone())
                     .or_insert_with(|| self.worktree_text(&t.comment.path));
-                Located::new(t, text.as_deref())
+                Located::new(t, text.as_deref(), &self.root)
             })
             .collect();
         if json {
@@ -299,6 +299,7 @@ impl Ctx {
             author,
             text.as_deref().unwrap_or(""),
         );
+        c.commit = git::head_commit(&self.root);
         self.store
             .put(&self.root_key, std::slice::from_mut(&mut c))?;
         println!("{}", c.id);
@@ -451,6 +452,7 @@ impl Ctx {
                                 replies: Vec::new(),
                             },
                             worktree.as_deref(),
+                            &self.root,
                         )
                     });
                 let json = serde_json::json!({ "event": event, "reply": reply });
@@ -477,7 +479,7 @@ impl Ctx {
                     },
                     _ => self.store.thread(&self.root_key, comment)?,
                 };
-                let located = Located::new(thread, worktree.as_deref());
+                let located = Located::new(thread, worktree.as_deref(), &self.root);
                 let json = serde_json::json!({ "event": event, "comment": located.to_json() });
                 (author, json, format!("{event}: {}", located.render()))
             };
@@ -540,24 +542,39 @@ struct Located {
     start: usize,
     end: usize,
     outdated: bool,
+    /// The file changed since the comment was written, but its lines were found.
+    changed: bool,
 }
 
 impl Located {
-    fn new(thread: Thread, worktree: Option<&str>) -> Located {
+    fn new(thread: Thread, worktree: Option<&str>, root: &Path) -> Located {
         let comment = &thread.comment;
-        let (start, end, outdated) = match (comment.side, worktree) {
+        let (start, end, outdated, changed) = match (comment.side, worktree) {
             (Side::New, Some(text)) => {
-                let loc = comment.locate(text);
-                (loc.lines.start + 1, loc.lines.end, loc.outdated)
+                let blob = comments::blob_oid(text);
+                let hunks = match &comment.commit {
+                    Some(commit) if comment.wants_hunks(&blob) => {
+                        git::hunks_since(root, commit, &comment.path)
+                    }
+                    _ => Vec::new(),
+                };
+                let loc = comment.locate(text, &blob, &hunks);
+                (
+                    loc.lines.start + 1,
+                    loc.lines.end,
+                    loc.outdated,
+                    loc.changed,
+                )
             }
-            (Side::New, None) => (comment.start, comment.end, true),
-            (Side::Old, _) => (comment.start, comment.end, false),
+            (Side::New, None) => (comment.start, comment.end, true, false),
+            (Side::Old, _) => (comment.start, comment.end, false, false),
         };
         Located {
             thread,
             start,
             end,
             outdated,
+            changed,
         }
     }
 
@@ -574,6 +591,7 @@ impl Located {
         v["start"] = self.start.into();
         v["end"] = self.end.into();
         v["outdated"] = self.outdated.into();
+        v["changed"] = self.changed.into();
         v["replies"] = serde_json::to_value(&self.thread.replies).unwrap();
         v
     }
@@ -589,6 +607,8 @@ impl Located {
         }
         if self.outdated {
             flags.push_str(" [outdated]");
+        } else if self.changed {
+            flags.push_str(" [file changed since]");
         }
         let mut out = format!(
             "{}  {}:{}{flags}  — {}, {}\n",

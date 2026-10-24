@@ -907,11 +907,29 @@ impl FileView {
         }
         drop(cards);
         if let Some(texts) = &self.texts {
+            let blobs = texts.each_ref().map(|t| comments::blob_oid(t));
+            let root = std::path::PathBuf::from(self.root());
+            let mut hunks: Option<Vec<comments::Hunk>> = None;
             for Thread { comment, replies } in list {
                 if kept.iter().any(|(c, _)| c.comment.id == comment.id) {
                     continue;
                 }
-                let loc = comment.locate(&texts[comment.side.index()]);
+                let side = comment.side.index();
+                let wanted = match &comment.commit {
+                    Some(commit) if comment.wants_hunks(&blobs[side]) => Some(commit),
+                    _ => None,
+                };
+                let hunks = match wanted {
+                    // Fetched once for every comment of the file, from whichever commit the
+                    // first one was written at: a later one is verified against its lines.
+                    Some(commit) => hunks
+                        .get_or_insert_with(|| {
+                            crate::git::hunks_since(&root, commit, &self.change.path)
+                        })
+                        .as_slice(),
+                    None => &[],
+                };
+                let loc = comment.locate(&texts[side], &blobs[side], hunks);
                 let outdated = loc.outdated;
                 kept.push((self.make_card(comment, replies, outdated, None), loc));
             }
@@ -1090,7 +1108,7 @@ impl FileView {
         }
         // Only one new comment at a time.
         self.remove_card("");
-        let comment = Comment::new(
+        let mut comment = Comment::new(
             &self.change.path,
             CommentSide::from_index(side),
             start..end + 1,
@@ -1098,9 +1116,11 @@ impl FileView {
             &self.shared.author,
             &texts[side],
         );
+        comment.commit = crate::git::head_commit(std::path::Path::new(&self.root()));
         let loc = Location {
             lines: start..end + 1,
             outdated: false,
+            changed: false,
         };
         let card = self.make_card(comment, Vec::new(), false, Some(Target::Comment));
         self.cards.borrow_mut().push((card, loc));

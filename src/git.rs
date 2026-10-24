@@ -1,5 +1,6 @@
 //! Collecting changed files and their old/new contents by shelling out to `git`.
 
+use crate::comments::Hunk;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -217,6 +218,51 @@ fn worktree_file(root: &Path, path: &str) -> Content {
         Ok(_) => std::fs::read(&full).map_or(Content::Missing, decode),
         Err(_) => Content::Missing,
     }
+}
+
+/// The commit that is checked out, if there is one.
+pub fn head_commit(root: &Path) -> Option<String> {
+    git_str(root, &["rev-parse", "--verify", "-q", "HEAD"]).ok()
+}
+
+/// The changes to a file between `commit` and the working tree.
+pub fn hunks_since(root: &Path, commit: &str, path: &str) -> Vec<Hunk> {
+    git(
+        root,
+        &[
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            commit,
+            "--",
+            path,
+        ],
+    )
+    .map(|out| parse_hunks(&String::from_utf8_lossy(&out)))
+    .unwrap_or_default()
+}
+
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let range = |s: &str| -> Option<(usize, usize)> {
+        let (start, len) = s.split_once(',').unwrap_or((s, "1"));
+        Some((start.parse().ok()?, len.parse().ok()?))
+    };
+    diff.lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("@@ -")?;
+            let (old, rest) = rest.split_once(" +")?;
+            let (new, _) = rest.split_once(" @@")?;
+            let ((old_start, old_len), (new_start, new_len)) = (range(old)?, range(new)?);
+            Some(Hunk {
+                old_start,
+                old_len,
+                new_start,
+                new_len,
+            })
+        })
+        .collect()
 }
 
 /// The top level of the repository containing `dir` (default: the current directory).
@@ -588,6 +634,18 @@ fn short(rev: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_zero_context_hunks() {
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3 +3,2 @@ fn x\n-a\n+b\n+c\n@@ -9,0 +11,3 @@\n+x\n";
+        let h = |old_start, old_len, new_start, new_len| Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+        };
+        assert_eq!(parse_hunks(diff), vec![h(3, 1, 3, 2), h(9, 0, 11, 3)]);
+    }
 
     #[test]
     fn staging_of_walks_the_transitions() {
