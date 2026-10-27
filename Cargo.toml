@@ -10,6 +10,7 @@ edition = "2024"
 # AdwSpinner, which GtkSpinner covers.
 adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+imara-diff = "0.2.0"
 pangocairo = "0.22"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

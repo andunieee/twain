@@ -1,6 +1,7 @@
 //! Line diffing, intra-line diffing and the vertical layout of a side-by-side file diff.
 
-use similar::{Algorithm, DiffOp, DiffTag, TextDiff};
+use imara_diff::{Algorithm as ImaraAlgorithm, Diff as ImaraDiff, InternedInput};
+use similar::{Algorithm, DiffTag, TextDiff};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -45,49 +46,46 @@ pub fn sanitize(text: &str) -> String {
     out
 }
 
-/// Diffs two texts line by line. Adjacent insertions/deletions are merged into a single
-/// change, so the result strictly alternates between equal and changed blocks.
+/// Diffs two texts line by line (Myers, then boundaries slid to where the indentation reads
+/// best). Each hunk is a change, so the result strictly alternates between equal and
+/// changed blocks.
 pub fn diff_lines(old: &str, new: &str) -> Vec<Block> {
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Patience)
-        .deadline(Instant::now() + Duration::from_secs(2))
-        .diff_lines(old, new);
+    let input = InternedInput::new(old, new);
+    let mut diff = ImaraDiff::compute(ImaraAlgorithm::Myers, &input);
+    diff.postprocess_lines(&input);
     let mut blocks = Vec::new();
-    for op in diff.ops() {
-        if let DiffOp::Equal {
-            old_index,
-            new_index,
-            len,
-        } = *op
-        {
+    let (mut o, mut n) = (0, 0);
+    for h in diff.hunks() {
+        let (ho, hn) = (
+            h.before.start as usize..h.before.end as usize,
+            h.after.start as usize..h.after.end as usize,
+        );
+        if ho.start > o {
             blocks.push(Block::Equal {
-                old: old_index,
-                new: new_index,
-                len,
-            });
-            continue;
-        }
-        let (o, n) = (op.old_range(), op.new_range());
-        match blocks.last_mut() {
-            Some(Block::Change(c)) => {
-                c.old.end = o.end;
-                c.new.end = n.end;
-            }
-            _ => blocks.push(Block::Change(Chunk {
-                kind: ChunkKind::Replace,
                 old: o,
                 new: n,
-            })),
+                len: ho.start - o,
+            });
         }
+        let kind = match (ho.is_empty(), hn.is_empty()) {
+            (true, _) => ChunkKind::Insert,
+            (_, true) => ChunkKind::Delete,
+            _ => ChunkKind::Replace,
+        };
+        (o, n) = (ho.end, hn.end);
+        blocks.push(Block::Change(Chunk {
+            kind,
+            old: ho,
+            new: hn,
+        }));
     }
-    for b in &mut blocks {
-        if let Block::Change(c) = b {
-            c.kind = match (c.old.is_empty(), c.new.is_empty()) {
-                (true, _) => ChunkKind::Insert,
-                (_, true) => ChunkKind::Delete,
-                _ => ChunkKind::Replace,
-            };
-        }
+    let total = [input.before.len(), input.after.len()];
+    if total[0] > o {
+        blocks.push(Block::Equal {
+            old: o,
+            new: n,
+            len: total[0] - o,
+        });
     }
     blocks
 }
