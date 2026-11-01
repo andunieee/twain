@@ -131,7 +131,7 @@ fn main() -> glib::ExitCode {
         }
     };
 
-    if !foreground && detach() {
+    if !foreground && opts.difftool.is_none() && detach() {
         return glib::ExitCode::SUCCESS;
     }
 

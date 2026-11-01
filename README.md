@@ -40,6 +40,41 @@ twain v1.0..main -- a.rs b.rs
 
 See `twain --help` for more.
 
+## As a Git difftool
+
+Twain can act as the backend for `git difftool`. Point git at it, globally or in one repository:
+
+```sh
+git config --global diff.tool twain
+git config --global difftool.twain.cmd 'twain --difftool "$LOCAL" "$REMOTE" --name "$MERGED"'
+```
+
+Then compare your uncommitted changes, or specific revisions, like with `git diff`:
+
+```sh
+git difftool                    # one window per changed file
+git difftool --dir-diff         # all changed files in one window
+git difftool HEAD~1
+git difftool v1.0..main
+```
+
+`--dir-diff` is usually the better fit for the way Twain shows files, since it keeps
+everything in a single window. It never prompts; to skip git's prompt when comparing
+files one by one too:
+
+```sh
+git config --global difftool.prompt false
+```
+
+To try it for a single invocation without changing your configuration:
+
+```sh
+git difftool --tool=twain --dir-diff
+```
+
+In this mode Twain stays in the foreground, because git removes the temporary files it
+hands over when the tool exits.
+
 ## Comments
 
 Select lines and press `C` or right-click the mouse to leave a comment on them.

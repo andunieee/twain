@@ -20,10 +20,17 @@ pub struct Options {
     pub paths: Vec<String>,
     /// Whether `--` was given, making every argument before it a revision.
     pub dashdash: bool,
+    /// Two paths to compare directly, as `git difftool` passes them: a pair of files, or
+    /// two directories with `--dir-diff`.
+    pub difftool: Option<(PathBuf, PathBuf)>,
+    /// Path of the compared file, when known (git difftool's `$MERGED`). Used to attach
+    /// comments to the right file in the repository.
+    pub name: Option<String>,
 }
 
 pub const USAGE: &str = "\
 usage: twain [-C <dir>] [--staged] [--foreground] [<rev> [<rev>]] [--] [<path>...]
+       twain --difftool <old> <new> [--name <path>]
        twain comment <command> ...   (see twain comment --help)
 
   twain                 HEAD vs working tree (staged + unstaged + untracked)
@@ -31,6 +38,9 @@ usage: twain [-C <dir>] [--staged] [--foreground] [<rev> [<rev>]] [--] [<path>..
   twain <rev>           the changes made by commit <rev>
   twain --staged <rev>  <rev> vs index
   twain <a>..<b>        <a> vs <b>   (also <a> <b>, and <a>...<b> for merge-base vs <b>)
+
+  --difftool compares two files, or two directories, as git difftool hands them over;
+  it stays in the foreground so they live as long as the window.
 
   Twain detaches from the terminal unless --foreground is given.
 
@@ -49,12 +59,21 @@ impl Options {
                 "-h" | "--help" => return Err(String::new()),
                 "--staged" | "--cached" => opts.staged = true,
                 "-C" => opts.dir = Some(args.next().ok_or("-C needs a directory")?.into()),
+                "--difftool" => {
+                    let old = args.next().ok_or("--difftool needs two paths")?;
+                    let new = args.next().ok_or("--difftool needs two paths")?;
+                    opts.difftool = Some((old.into(), new.into()));
+                }
+                "--name" => opts.name = Some(args.next().ok_or("--name needs a path")?),
                 s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
                 _ => opts.args.push(arg),
             }
         }
         if opts.dashdash && opts.args.len() > 2 {
             return Err("at most two revisions can be given".into());
+        }
+        if opts.difftool.is_some() && (!opts.args.is_empty() || opts.dashdash) {
+            return Err("--difftool takes no revisions or paths of its own".into());
         }
         Ok(opts)
     }
@@ -283,6 +302,9 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         Some(d) => d.clone(),
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
+    if let Some((old, new)) = &opts.difftool {
+        return load_difftool(opts, &cwd, old, new);
+    }
     let root = repo_root(Some(&cwd))?;
     let (revs, focus) = split_args(&root, &cwd, opts)?;
 
@@ -472,6 +494,154 @@ pub fn load(opts: &Options) -> Result<Comparison, String> {
         unchanged,
         focus,
     })
+}
+
+/// Loads a comparison handed over by `git difftool`: two files, or the two directories of
+/// a `--dir-diff`.
+fn load_difftool(opts: &Options, cwd: &Path, old: &Path, new: &Path) -> Result<Comparison, String> {
+    let (root, name) = difftool_identity(cwd, opts.name.as_deref(), old, new);
+    let dirs = old.is_dir() && new.is_dir();
+    if old.is_dir() != new.is_dir() {
+        return Err("--difftool needs two files or two directories".into());
+    }
+    let files = if dirs {
+        let mut files = Vec::new();
+        for path in tree_paths(old, new)? {
+            let old_content = path_content(&old.join(&path));
+            let new_content = path_content(&new.join(&path));
+            let status = status_of(&old_content, &new_content);
+            files.push(FileChange {
+                path,
+                old_path: None,
+                status,
+                old: old_content,
+                new: new_content,
+                index: None,
+                staging: None,
+            });
+        }
+        files
+    } else {
+        let old_content = path_content(old);
+        let new_content = path_content(new);
+        let status = status_of(&old_content, &new_content);
+        vec![FileChange {
+            path: name.clone(),
+            old_path: None,
+            status,
+            old: old_content,
+            new: new_content,
+            index: None,
+            staging: None,
+        }]
+    };
+    let description = if dirs {
+        format!("{} → {}", label(old), label(new))
+    } else {
+        name
+    };
+    Ok(Comparison {
+        root,
+        description,
+        files,
+        unchanged: Vec::new(),
+        focus: Vec::new(),
+    })
+}
+
+/// The repository root and the repository-relative path a difftool comparison belongs to.
+/// `name` is what git passes as `$MERGED`; without it, fall back to the file's name.
+fn difftool_identity(cwd: &Path, name: Option<&str>, old: &Path, new: &Path) -> (PathBuf, String) {
+    let root = repo_root(Some(cwd)).ok();
+    if let Some(name) = name.filter(|n| !n.is_empty()) {
+        let path = Path::new(name);
+        if let Some(root) = &root {
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            if let Ok(rel) = abs.strip_prefix(root) {
+                return (root.clone(), rel.to_string_lossy().into_owned());
+            }
+        }
+        return (cwd.to_path_buf(), name.to_string());
+    }
+    let file = [new, old]
+        .into_iter()
+        .find(|p| *p != Path::new("/dev/null"))
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "diff".to_string());
+    match root {
+        Some(root) => {
+            let prefix = git_str(cwd, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+            (root, format!("{prefix}{file}"))
+        }
+        None => (cwd.to_path_buf(), file),
+    }
+}
+
+/// Every file path in either directory, recursively, relative to it and sorted.
+fn tree_paths(a: &Path, b: &Path) -> Result<Vec<String>, String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for dir in [a, b] {
+        collect_files(dir, "", &mut paths)?;
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn collect_files(
+    dir: &Path,
+    prefix: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        // Follow symlinks only as files (git makes the unchanged side of a dir-diff out of
+        // them), never as directories.
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            collect_files(&path, &rel, out)?;
+        } else {
+            out.insert(rel);
+        }
+    }
+    Ok(())
+}
+
+/// The content of one side of a difftool comparison. `/dev/null` and paths that are gone
+/// are the missing side of an added or deleted file.
+fn path_content(path: &Path) -> Content {
+    if path == Path::new("/dev/null") {
+        return Content::Missing;
+    }
+    std::fs::read(path).map_or(Content::Missing, decode)
+}
+
+fn status_of(old: &Content, new: &Content) -> char {
+    match (old, new) {
+        (Content::Missing, _) => 'A',
+        (_, Content::Missing) => 'D',
+        _ => 'M',
+    }
+}
+
+/// A short name for a side of a difftool comparison, for the window subtitle.
+fn label(path: &Path) -> String {
+    if path == Path::new("/dev/null") {
+        return "empty".into();
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn is_commit(root: &Path, rev: &str) -> bool {
@@ -728,6 +898,100 @@ mod tests {
             vec!["gone".to_string(), "d/b".to_string()]
         );
         assert!(load(&["nonexistent"]).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn difftool_files_and_directories() {
+        let root = std::env::temp_dir().join(format!("twain-difftool-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (left, right) = (root.join("left"), root.join("right"));
+        std::fs::create_dir_all(left.join("d")).unwrap();
+        std::fs::create_dir_all(right.join("d")).unwrap();
+        std::fs::write(left.join("same"), "s\n").unwrap();
+        std::fs::write(right.join("same"), "s\n").unwrap();
+        std::fs::write(left.join("d/gone"), "1\n").unwrap();
+        std::fs::write(right.join("d/new"), "2\n").unwrap();
+        std::fs::write(left.join("changed"), "a\n").unwrap();
+        std::fs::write(right.join("changed"), "b\n").unwrap();
+
+        let load = |args: &[&str]| {
+            let mut opts = Options::parse(args.iter().map(|s| s.to_string())).unwrap();
+            opts.dir = Some(root.clone());
+            super::load(&opts)
+        };
+        // A pair of files, with the name git uses to attach comments.
+        let cmp = load(&[
+            "--difftool",
+            left.join("changed").to_str().unwrap(),
+            right.join("changed").to_str().unwrap(),
+            "--name",
+            "changed",
+        ])
+        .unwrap();
+        assert_eq!(cmp.files.len(), 1);
+        assert_eq!(cmp.files[0].path, "changed");
+        assert_eq!(cmp.files[0].status, 'M');
+        assert_eq!(cmp.files[0].old, Content::Text("a\n".into()));
+        assert_eq!(cmp.files[0].new, Content::Text("b\n".into()));
+
+        // A file missing on one side.
+        let cmp = load(&[
+            "--difftool",
+            left.join("d/gone").to_str().unwrap(),
+            "/dev/null",
+            "--name",
+            "d/gone",
+        ])
+        .unwrap();
+        assert_eq!(cmp.files[0].status, 'D');
+        assert_eq!(cmp.files[0].new, Content::Missing);
+
+        // Two directories, as `git difftool --dir-diff` hands them over.
+        let cmp = load(&[
+            "--difftool",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+            "--name",
+            "",
+        ])
+        .unwrap();
+        let changes: Vec<_> = cmp
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("changed", 'M'),
+                ("d/gone", 'D'),
+                ("d/new", 'A'),
+                ("same", 'M')
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn difftool_rejects_mixed_files_and_directories() {
+        let root =
+            std::env::temp_dir().join(format!("twain-difftool-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), "x\n").unwrap();
+        let mut opts = Options::parse(
+            [
+                "--difftool",
+                root.join("f").to_str().unwrap(),
+                root.to_str().unwrap(),
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        opts.dir = Some(root.clone());
+        assert!(super::load(&opts).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
