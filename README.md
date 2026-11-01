@@ -81,6 +81,29 @@ Select lines and press `C` or right-click the mouse to leave a comment on them.
 
 Tell your AI agent to look into `twain comment --help` so it can participate.
 
+## Working with AI
+
+Comments are a good channel between you and an agent, because they stay attached to the
+lines instead of getting lost in chat. A few ways to use them:
+
+- **Have the agent annotate its own work.** Ask it to leave a `twain comment` on the
+  significant parts of a change — a non-obvious decision, a tradeoff, something it wants a
+  second opinion on — rather than writing a long explanation in the chat. A short note on
+  the lines it is about is easier to review than a wall of prose, and it stays there after
+  the conversation is gone. Mention this in `AGENTS.md` or whichever instructions the
+  agent reads.
+- **Review, then hand it back.** Leave comments yourself while reading the diff, then ask
+  the agent to run `twain comment list --unresolved` and address each one: change the
+  code, reply in the thread with `twain comment reply`, and mark what is done with
+  `twain comment resolve`. The discussion stays next to the code it is about.
+- **Put it on watch.** Have the agent run `twain comment watch --once --not-author agent`
+  and wait for your next comment, then address it, reply, and wait again. That gives you a
+  live review loop: you comment on the lines and the agent sees it immediately, without
+  copying snippets or line numbers into the chat.
+
+Agents can read `twain comment --help` for the commands, line ranges, ids, JSON output and
+the rest.
+
 ## Install
 
 Download a binary or a Flatpak bundle from the [latest release](https://github.com/andunieee/twain/releases/latest) or build from source (needs GTK 4, GtkSourceView 5 and libadwaita):

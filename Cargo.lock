@@ -1683,7 +1683,7 @@ checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
 
 [[package]]
 name = "twain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gtk4",
  "imara-diff",
