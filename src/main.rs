@@ -4,6 +4,7 @@ mod comments;
 mod diff;
 mod file_view;
 mod git;
+mod lsp;
 mod state;
 mod syntax;
 mod tree;
@@ -62,6 +63,16 @@ const CSS: &str = r#"
 .comment-badge.warning { color: @warning_color; background: alpha(@warning_color, 0.15); }
 .comment-badge.success { color: @success_color; background: alpha(@success_color, 0.15); }
 .comment-count { color: #c88a0e; font-size: smaller; font-weight: bold; }
+.lsp-card { padding: 8px 10px; }
+.lsp-path { font-family: monospace; font-size: smaller; opacity: 0.75; }
+.lsp-source {
+    font-family: monospace;
+    font-size: smaller;
+    padding: 3px 6px;
+    border-radius: 4px;
+    background: alpha(currentColor, 0.06);
+}
+.lsp-message { font-family: monospace; font-size: smaller; }
 scrollbar slider {
     min-width: 12px;
     min-height: 12px;

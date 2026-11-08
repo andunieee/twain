@@ -317,6 +317,9 @@ impl Window {
             on_staged: RefCell::default(),
             root: RefCell::default(),
             author: glib::user_name().to_string_lossy().into_owned(),
+            lsp: crate::lsp::Manager::new(),
+            on_goto: RefCell::default(),
+            has_file: RefCell::default(),
         });
         let listener = Listener::bind()
             .inspect_err(|e| eprintln!("twain: won't see comments from other processes: {e}"))
@@ -712,6 +715,22 @@ impl Window {
                 this.queue_sync();
             }
         }));
+        let weak = Rc::downgrade(self);
+        *self.shared.on_goto.borrow_mut() = Some(Box::new(move |path, line| {
+            if let Some(this) = weak.upgrade() {
+                this.goto_source(path, line);
+            }
+        }));
+        let weak = Rc::downgrade(self);
+        *self.shared.has_file.borrow_mut() = Some(Box::new(move |path| {
+            let Some(this) = weak.upgrade() else {
+                return false;
+            };
+            this.files
+                .borrow()
+                .iter()
+                .any(|file| file.change.path == path)
+        }));
 
         let weak = Rc::downgrade(self);
         self.search_entry.connect_search_changed(move |_| {
@@ -832,6 +851,7 @@ impl Window {
             .set_title(repo_name.as_deref().unwrap_or("Twain"));
         self.title.set_subtitle(&cmp.description);
         *self.shared.root.borrow_mut() = cmp.root.to_string_lossy().into_owned();
+        self.shared.lsp.set_root(cmp.root.clone());
         self.window.set_title(Some(&format!(
             "{} — Twain",
             repo_name.as_deref().unwrap_or("")
@@ -1099,6 +1119,57 @@ impl Window {
         self.scroll_to_file(i);
     }
 
+    /// Scrolls to a line of the new side of a changed file, revealing the file if needed.
+    /// Definitions can point at files outside the diff, which have nowhere to go here.
+    fn goto_source(&self, path: &str, line: usize) {
+        let files = self.files.borrow();
+        let Some((i, file)) = files
+            .iter()
+            .enumerate()
+            .find(|(_, file)| file.change.path == path)
+        else {
+            return;
+        };
+        if file.is_folded() {
+            file.set_folded(false);
+        }
+        let hidden = {
+            let layout = file.layout.borrow();
+            layout.sides[1]
+                .hidden
+                .iter()
+                .any(|range| range.contains(&line))
+        };
+        if hidden {
+            file.set_collapsed(false);
+        }
+        file.ensure_built();
+        let Some(body) = file.body_y(1, &self.contents[1]) else {
+            return;
+        };
+        // The server may know a newer version of the file than the diff shows.
+        let line = file.sides().map_or(line, |sides| {
+            line.min(sides[1].buffer.line_count() as usize - 1)
+        });
+        let y = body + file.layout.borrow().line_y(1, line) as f64;
+        // Mark the line as a search match does, and let the next search clear it.
+        self.clear_current_tag();
+        if let Some(side) = file.sides().map(|sides| &sides[1]) {
+            let start = side
+                .buffer
+                .iter_at_line(line as i32)
+                .unwrap_or_else(|| side.buffer.end_iter());
+            let mut end = start;
+            end.forward_to_line_end();
+            side.current
+                .set_priority(side.buffer.tag_table().size() - 1);
+            side.buffer.apply_tag(&side.current, &start, &end);
+            self.tagged.set(Some((i, 1)));
+        }
+        let page = self.scrollers[1].vadjustment().page_size();
+        self.scroll_column(1, y - page / 3.0);
+    }
+
     /// The sidebar's context menu for files (one, or those under a directory): hide them, or
     /// show them in full or as changes only.
     ///
@@ -1229,6 +1300,7 @@ impl Window {
 
         parent.insert_action_group("file", Some(&group));
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_cursor_from_name(Some("pointer"));
         popover.set_parent(parent);
         popover.set_has_arrow(false);
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));

@@ -10,6 +10,7 @@ use crate::comment_card::{Action, Card, Target};
 use crate::comments::{self, Comment, Location, Reply, Side as CommentSide, Thread};
 use crate::diff::{self, Block, ChunkKind, Gap, Layout, Note};
 use crate::git::{Content, FileChange, Staging, staging_of};
+use crate::lsp;
 use gtk::prelude::*;
 use gtk::{cairo, gdk, gio, glib, graphene};
 use sourceview5::prelude::*;
@@ -184,6 +185,12 @@ pub struct Shared {
     pub root: RefCell<String>,
     /// Author of comments written in this window.
     pub author: String,
+    /// Language servers for the window's repository.
+    pub lsp: std::sync::Arc<lsp::Manager>,
+    /// Called with a path and 0-based line to reveal a definition in the diff.
+    pub on_goto: RefCell<Option<Box<dyn Fn(&str, usize)>>>,
+    /// Whether a path is one of the files shown, so that it can be jumped to.
+    pub has_file: RefCell<Option<Box<dyn Fn(&str) -> bool>>>,
 }
 
 /// What a file shows in one column: a header and the body below it.
@@ -325,6 +332,13 @@ pub struct FileView {
     menu_region: RefCell<Option<std::ops::Range<usize>>>,
     /// The change the text's context menu offers to stage (true) or unstage (false).
     menu_stage: RefCell<Option<(bool, diff::Chunk)>>,
+    /// The symbol the text's context menu is about: side, 0-based line and UTF-16 column,
+    /// and where to point the card.
+    menu_symbol: RefCell<Option<(usize, u32, u32, f64, f64)>>,
+    /// The definition or type card, while one is open.
+    lsp_popover: RefCell<Option<gtk::Popover>>,
+    /// Guards against a slow answer from an earlier lookup replacing a newer one.
+    lsp_seq: Cell<u64>,
     pub layout: RefCell<Layout>,
     /// Comment cards (including one being written) and where their lines are.
     cards: RefCell<Vec<(Card, Location)>>,
@@ -387,6 +401,9 @@ impl FileView {
             revealed: RefCell::default(),
             menu_region: RefCell::default(),
             menu_stage: RefCell::default(),
+            menu_symbol: RefCell::default(),
+            lsp_popover: RefCell::default(),
+            lsp_seq: Cell::default(),
             layout: RefCell::default(),
             cards: RefCell::default(),
             on_toggle: RefCell::default(),
@@ -686,6 +703,7 @@ impl FileView {
 
         body.insert_action_group("gap", Some(&group));
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_cursor_from_name(Some("pointer"));
         popover.set_parent(body);
         popover.set_has_arrow(false);
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -1158,9 +1176,25 @@ impl FileView {
             }
         });
         group.add_action(&action);
+        for (name, what) in [
+            ("definition", lsp::Lookup::Definition),
+            ("type", lsp::Lookup::Hover),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = self.weak_self.clone();
+            action.connect_activate(move |_, _| {
+                if let Some(this) = weak.upgrade()
+                    && let Some((side, line, col, x, y)) = this.menu_symbol.take()
+                {
+                    this.lookup_symbol(side, line, col, (x, y), what);
+                }
+            });
+            group.add_action(&action);
+        }
         side.view.insert_action_group("side", Some(&group));
 
         let keys = gtk::EventControllerKey::new();
+        let pending_g = Rc::new(Cell::new(false));
         let weak = self.weak_self.clone();
         keys.connect_key_pressed(move |_, key, _, mods| {
             let plain = !mods.intersects(
@@ -1175,9 +1209,69 @@ impl FileView {
                 this.comment_on_selection(i);
                 return glib::Propagation::Stop;
             }
+            // `gd`, Vim style. The pause keeps a `g` typed much earlier from turning a later
+            // `d` into a definition lookup.
+            if plain && matches!(key, gdk::Key::g | gdk::Key::G) {
+                pending_g.set(true);
+                let pending = pending_g.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                    pending.set(false)
+                });
+                return glib::Propagation::Stop;
+            }
+            let what =
+                if plain && matches!(key, gdk::Key::d | gdk::Key::D) && pending_g.replace(false) {
+                    Some(lsp::Lookup::Definition)
+                } else if plain && matches!(key, gdk::Key::k | gdk::Key::K) {
+                    Some(lsp::Lookup::Hover)
+                } else {
+                    pending_g.set(false);
+                    None
+                };
+            if let Some(what) = what
+                && let Some(this) = weak.upgrade()
+            {
+                if let Some((line, col, at)) = this.symbol_here(i) {
+                    this.lookup_symbol(i, line, col, at, what);
+                }
+                return glib::Propagation::Stop;
+            }
             glib::Propagation::Proceed
         });
         side.view.add_controller(keys);
+
+        // Ctrl+click, like editors: show the definition of the symbol under the pointer.
+        let click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_PRIMARY)
+            .build();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = self.weak_self.clone();
+        click.connect_pressed(move |gesture, _, x, y| {
+            if !gesture
+                .current_event_state()
+                .contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                return;
+            }
+            let Some(this) = weak.upgrade() else { return };
+            let Some(sides) = this.sides() else { return };
+            let view = &sides[i].view;
+            let (bx, by) =
+                view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let Some(iter) = view.iter_at_location(bx, by) else {
+                return;
+            };
+            let ch = iter.char();
+            if ch == '\0' || ch.is_whitespace() {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            view.buffer().place_cursor(&iter);
+            let text = line_text(&view.buffer(), iter.line());
+            let col = utf16_col(&text, iter.line_offset() as usize);
+            this.lookup_symbol(i, iter.line() as u32, col, (x, y), lsp::Lookup::Definition);
+        });
+        side.view.add_controller(click);
 
         // Right clicks get our own menu in place of the built-in one, whose editing entries
         // are of no use here. A right click outside the selection comments on the clicked
@@ -1207,6 +1301,21 @@ impl FileView {
             if !inside {
                 buffer.place_cursor(&iter);
             }
+            // A selection was made on purpose, so ask about its start; otherwise about the
+            // clicked position itself.
+            let symbol = buffer
+                .selection_bounds()
+                .filter(|(a, b)| a.line() <= iter.line() && iter.line() <= b.line())
+                .map(|(a, _)| a)
+                .unwrap_or(iter);
+            let symbol_text = line_text(&buffer, symbol.line());
+            *this.menu_symbol.borrow_mut() = Some((
+                i,
+                symbol.line() as u32,
+                utf16_col(&symbol_text, symbol.line_offset() as usize),
+                x,
+                y,
+            ));
             let menu = gio::Menu::new();
             let section = gio::Menu::new();
             section.append(Some("Copy"), Some("clipboard.copy"));
@@ -1224,6 +1333,14 @@ impl FileView {
             }
             menu.append_section(None, &section);
             *this.menu_region.borrow_mut() = region.map(|r| r[0].clone());
+
+            let section = gio::Menu::new();
+            section.append(
+                Some("Show Definition (gd or Ctrl+click)"),
+                Some("side.definition"),
+            );
+            section.append(Some("Show Type (K)"), Some("side.type"));
+            menu.append_section(None, &section);
 
             let chunk = this.can_stage().then(|| {
                 this.blocks.iter().find_map(|b| match b {
@@ -1250,6 +1367,7 @@ impl FileView {
             *this.menu_stage.borrow_mut() = stage;
 
             let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_cursor_from_name(Some("pointer"));
             popover.set_parent(&view);
             popover.set_has_arrow(false);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -1268,6 +1386,198 @@ impl FileView {
             popover.popup();
         });
         side.view.add_controller(click);
+    }
+
+    /// The selected symbol, or the one under the cursor, on one side: its LSP position and
+    /// where to point a card about it.
+    fn symbol_here(&self, side: usize) -> Option<(u32, u32, (f64, f64))> {
+        let sides = self.sides()?;
+        let buffer = &sides[side].buffer;
+        let iter = buffer
+            .selection_bounds()
+            .map(|(start, _)| start)
+            .unwrap_or_else(|| buffer.iter_at_mark(&buffer.get_insert()));
+        let text = line_text(buffer, iter.line());
+        let col = utf16_col(&text, iter.line_offset() as usize);
+        let rect = sides[side].view.iter_location(&iter);
+        let (x, y) = sides[side].view.buffer_to_window_coords(
+            gtk::TextWindowType::Widget,
+            rect.x(),
+            rect.y(),
+        );
+        Some((iter.line() as u32, col, (x as f64, y as f64)))
+    }
+
+    /// Asks the language server about a symbol and shows the answer in a card by it.
+    fn lookup_symbol(&self, side: usize, line: u32, col: u32, at: (f64, f64), what: lsp::Lookup) {
+        let Some(texts) = self.texts.as_ref() else {
+            return;
+        };
+        let (path, text) = match side {
+            0 => (
+                self.change.old_path.as_deref().unwrap_or(&self.change.path),
+                &texts[0],
+            ),
+            _ => (self.change.path.as_str(), &texts[1]),
+        };
+        if text.is_empty() {
+            return;
+        }
+        let seq = self.lsp_seq.get() + 1;
+        self.lsp_seq.set(seq);
+        self.open_lsp(side, at);
+        self.fill_lsp(|card| card.append(&message_label("Looking up…")));
+        let (lsp, path, text) = (self.shared.lsp.clone(), path.to_string(), text.clone());
+        let weak = self.weak_self.clone();
+        glib::spawn_future_local(async move {
+            let answer =
+                gio::spawn_blocking(move || lsp.lookup(&path, &text, line, col, what)).await;
+            let Some(this) = weak.upgrade() else { return };
+            // A newer lookup may have been started while this one waited.
+            if this.lsp_seq.get() == seq {
+                this.populate_lsp(answer);
+            }
+        });
+    }
+
+    /// A fresh card pointed at the symbol; the caller fills it.
+    fn open_lsp(&self, side: usize, at: (f64, f64)) {
+        self.close_lsp();
+        let Some(sides) = self.sides() else { return };
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        card.add_css_class("lsp-card");
+        card.set_size_request(420, -1);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&card));
+        popover.set_parent(&sides[side].view);
+        popover.set_has_arrow(true);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(at.0 as i32, at.1 as i32, 1, 1)));
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
+        *self.lsp_popover.borrow_mut() = Some(popover);
+    }
+
+    fn close_lsp(&self) {
+        if let Some(popover) = self.lsp_popover.borrow_mut().take() {
+            popover.popdown();
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        }
+    }
+
+    fn fill_lsp(&self, fill: impl FnOnce(&gtk::Box)) {
+        let Some(popover) = self.lsp_popover.borrow().clone() else {
+            return;
+        };
+        let Some(card) = popover.child().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        while let Some(child) = card.first_child() {
+            card.remove(&child);
+        }
+        fill(&card);
+        popover.present();
+    }
+
+    fn populate_lsp<E>(&self, answer: Result<Result<lsp::Answer, String>, E>) {
+        let goto = |path: &str| {
+            self.shared
+                .has_file
+                .borrow()
+                .as_ref()
+                .is_some_and(|f| f(path))
+        };
+        match answer {
+            Ok(Ok(lsp::Answer::Definition(locations))) => self.fill_lsp(|card| {
+                let title = match locations.len() {
+                    0 => "No definition found".to_string(),
+                    1 => "Definition".to_string(),
+                    n => format!("{n} definitions"),
+                };
+                card.append(&caption(&title));
+                for location in locations.iter().take(3) {
+                    let path = gtk::Label::builder()
+                        .label(format!("{}:{}", location.path, location.line + 1))
+                        .xalign(0.0)
+                        .max_width_chars(60)
+                        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                        .build();
+                    path.add_css_class("lsp-path");
+                    card.append(&path);
+                    let in_diff = goto(&location.path);
+                    if let Some(snippet) = &location.snippet {
+                        let code = gtk::Label::builder()
+                            .label(if in_diff {
+                                first_lines(snippet, 8)
+                            } else {
+                                snippet.clone()
+                            })
+                            .xalign(0.0)
+                            .max_width_chars(72)
+                            .wrap(true)
+                            .wrap_mode(gtk::pango::WrapMode::Char)
+                            .selectable(true)
+                            .build();
+                        if in_diff {
+                            code.add_css_class("lsp-source");
+                            card.append(&code);
+                        } else {
+                            // Somewhere else on the machine: show a taller peek, since
+                            // there's nowhere in this diff to go.
+                            let scroller = gtk::ScrolledWindow::builder()
+                                .hscrollbar_policy(gtk::PolicyType::Never)
+                                .vscrollbar_policy(gtk::PolicyType::Automatic)
+                                .propagate_natural_height(true)
+                                .max_content_height(240)
+                                .child(&code)
+                                .build();
+                            scroller.add_css_class("lsp-source");
+                            card.append(&scroller);
+                        }
+                    }
+                    if in_diff {
+                        let button = gtk::Button::with_label("Show in Diff");
+                        button.add_css_class("pill");
+                        button.set_halign(gtk::Align::End);
+                        button.set_cursor_from_name(Some("pointer"));
+                        let weak = self.weak_self.clone();
+                        let (path, line) = (location.path.clone(), location.line);
+                        button.connect_clicked(move |_| {
+                            if let Some(this) = weak.upgrade() {
+                                if let Some(go) = &*this.shared.on_goto.borrow() {
+                                    go(&path, line);
+                                }
+                                this.close_lsp();
+                            }
+                        });
+                        card.append(&button);
+                    } else {
+                        let button = gtk::Button::with_label("Copy Path");
+                        button.add_css_class("pill");
+                        button.set_halign(gtk::Align::End);
+                        button.set_cursor_from_name(Some("pointer"));
+                        let location = format!("{}:{}", location.path, location.line + 1);
+                        let clipboard = card.clipboard();
+                        button.connect_clicked(move |_| clipboard.set_text(&location));
+                        card.append(&button);
+                    }
+                }
+                let more = locations.len().saturating_sub(3);
+                if more > 0 {
+                    card.append(&caption(&format!("and {more} more")));
+                }
+            }),
+            Ok(Ok(lsp::Answer::Hover(text))) => self.fill_lsp(move |card| {
+                card.append(&caption("Type"));
+                card.append(&message_label(&text));
+            }),
+            Ok(Err(err)) => self.fill_lsp(move |card| card.append(&message_label(&err))),
+            Err(_) => self.fill_lsp(|card| card.append(&message_label("internal error"))),
+        }
     }
 
     /// Whether changes can be staged and unstaged here: the new side is the working tree, and
@@ -1577,6 +1887,61 @@ impl FileView {
             pangocairo::functions::show_layout(cr, &text_layout);
         }
     }
+}
+
+impl Drop for FileView {
+    fn drop(&mut self) {
+        self.close_lsp();
+    }
+}
+
+/// A line's text, without its newline.
+fn line_text(buffer: &impl IsA<gtk::TextBuffer>, line: i32) -> String {
+    let buffer = buffer.upcast_ref::<gtk::TextBuffer>();
+    let start = buffer
+        .iter_at_line(line)
+        .unwrap_or_else(|| buffer.end_iter());
+    let mut end = start;
+    end.forward_to_line_end();
+    buffer.text(&start, &end, true).to_string()
+}
+
+/// An LSP column: UTF-16 code units from the start of the line, as servers count them.
+fn utf16_col(line: &str, char_offset: usize) -> u32 {
+    line.chars()
+        .take(char_offset)
+        .map(|c| c.len_utf16() as u32)
+        .sum()
+}
+
+fn caption(text: &str) -> gtk::Label {
+    let label = gtk::Label::builder().label(text).xalign(0.0).build();
+    label.add_css_class("dim-label");
+    label.add_css_class("caption");
+    label
+}
+
+/// The first `n` lines of a snippet, with an ellipsis when there are more.
+fn first_lines(text: &str, n: usize) -> String {
+    let mut lines = text.lines();
+    let mut kept: Vec<&str> = lines.by_ref().take(n).collect();
+    if lines.next().is_some() {
+        kept.push("…");
+    }
+    kept.join("\n")
+}
+
+fn message_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .max_width_chars(72)
+        .selectable(true)
+        .build();
+    label.add_css_class("lsp-message");
+    label
 }
 
 /// A band hugging one edge of the link map (`dir` 1 for the left, -1 for the right), for a
